@@ -1,5 +1,5 @@
 {
-  "name": "frida-test-agent",
+  "name": "spyra-agent",
   "version": "1.0.0",
   "description": "Frida agent written in TypeScript",
   "private": true,
@@ -15,8 +15,6 @@
     "@types/node": "^18.14.0"
   },
   "dependencies": {
-    "frida-compile": "^19.0.4",
-    "frida-java-bridge": "^7.0.10",
-    "frida-objc-bridge": "^8.0.5"
+    "frida-java-bridge": "^7.0.12"
   }
 }
