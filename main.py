@@ -5,6 +5,8 @@ import shutil
 import json
 import frida
 import time
+import hashlib
+import argparse
 from pathlib import Path
 from rich.panel import Panel
 from rich.table import Table
@@ -158,7 +160,24 @@ def extract_domain(url):
         return ""
 
 
-def save_sequences(package_name, api_seq, net_seq, start_time):
+def compute_apk_hash(apk_path):
+    """Compute SHA256 hash of the APK for dataset integrity and VirusTotal lookup."""
+    sha256 = hashlib.sha256()
+    with open(apk_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, label=None, label_source=None):
+    """Save captured sequences with full metadata for LSTM training.
+    
+    Args:
+        label: Ground-truth label (e.g., 'malware', 'benign', or malware family name).
+               If None, saved as 'unlabeled' — must be filled before training.
+        label_source: Where the label came from (e.g., 'virustotal', 'malwarebazaar',
+                      'androzoo', 'manual').
+    """
     output_dir = Path("output") / package_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,12 +187,19 @@ def save_sequences(package_name, api_seq, net_seq, start_time):
     start_iso = datetime.fromtimestamp(start_time).isoformat() if start_time else None
     end_iso = datetime.fromtimestamp(end_time).isoformat()
 
+    base_metadata = {
+        "package_name": package_name,
+        "apk_sha256": apk_hash,
+        "label": label or "unlabeled",
+        "label_source": label_source,
+        "capture_start": start_iso,
+        "capture_end": end_iso,
+        "duration_seconds": round(duration, 3),
+    }
+
     api_data = {
         "metadata": {
-            "package_name": package_name,
-            "capture_start": start_iso,
-            "capture_end": end_iso,
-            "duration_seconds": round(duration, 3),
+            **base_metadata,
             "total_calls": len(api_seq),
         },
         "sequence": api_seq,
@@ -191,10 +217,7 @@ def save_sequences(package_name, api_seq, net_seq, start_time):
 
     net_data = {
         "metadata": {
-            "package_name": package_name,
-            "capture_start": start_iso,
-            "capture_end": end_iso,
-            "duration_seconds": round(duration, 3),
+            **base_metadata,
             "total_requests": len(net_seq),
             "unique_domains": unique_domains,
         },
@@ -347,7 +370,7 @@ def launch_app(device, package_name, apk_path=None, max_retries=3):
     )
 
 
-def run_frida_script(device, package_name, js_file, apk_path=None):
+def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None, label=None, label_source=None):
     api_sequence = []
     network_sequence = []
     start_time = None
@@ -360,7 +383,8 @@ def run_frida_script(device, package_name, js_file, apk_path=None):
         if start_time is None and (api_sequence or network_sequence):
             start_time = time.time()
         if api_sequence or network_sequence:
-            save_sequences(package_name, api_sequence, network_sequence, start_time)
+            save_sequences(package_name, api_sequence, network_sequence, start_time,
+                           apk_hash=apk_hash, label=label, label_source=label_source)
         else:
             console.print("[yellow]No data captured to save.[/yellow]")
 
@@ -383,6 +407,11 @@ def run_frida_script(device, package_name, js_file, apk_path=None):
             if message["type"] == "send":
                 payload = message.get("payload", {})
                 if not isinstance(payload, dict):
+                    return
+                # unwrap batched events sent by bufferedSend() in the JS agent
+                if payload.get("type") == "batch":
+                    for evt in payload.get("events", []):
+                        on_message({"type": "send", "payload": evt}, data)
                     return
                 msg_type = payload.get("type", "unknown")
                 if start_time is None:
@@ -539,6 +568,11 @@ def run_frida_script(device, package_name, js_file, apk_path=None):
                 elif msg_type == "intent":
                     action = payload.get("intent_action", "")
                     console.print(f"[yellow][INTENT][/yellow] {action}")
+                elif msg_type == "stalker":
+                    action = payload.get("action", "")
+                    count = payload.get("count", 0)
+                    if action == "call_graph":
+                        console.print(f"[dim][STALKER][/dim] Native call graph: {count} events")
             elif message["type"] == "error":
                 console.print(
                     f"[red][ERROR][/red] {message.get('description', message)}"
@@ -580,20 +614,41 @@ def run_frida_script(device, package_name, js_file, apk_path=None):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Spyra — Android Malware Behavior Analysis Framework",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  python3 main.py sample.apk\n"
+               "  python3 main.py sample.apk --label malware --label-source virustotal\n"
+               "  python3 main.py sample.apk --label benign --label-source manual\n",
+    )
+    parser.add_argument("apk_file", help="Path to the APK file to analyze")
+    parser.add_argument(
+        "--label",
+        default=None,
+        help="Ground-truth label for LSTM training (e.g., 'malware', 'benign', "
+             "or malware family name like 'banker.anubis'). "
+             "If omitted, saved as 'unlabeled'.",
+    )
+    parser.add_argument(
+        "--label-source",
+        default=None,
+        dest="label_source",
+        help="Source of the ground-truth label (e.g., 'virustotal', 'malwarebazaar', "
+             "'androzoo', 'manual').",
+    )
+
+    args = parser.parse_args()
+
     console.print(
         Panel.fit(
             "[bold cyan]APK Malware Analysis Automation[/bold cyan]\n"
-            "[dim]Framework Detection + API Monitoring[/dim]",
+            "[dim]Framework Detection + API Monitoring v1.0.2[/dim]",
             border_style="cyan",
         )
     )
 
-    if len(sys.argv) < 2:
-        console.print("\n[yellow]Usage:[/yellow] python3 main.py <apk_file>")
-        console.print("[dim]Example: python3 main.py app.apk[/dim]\n")
-        sys.exit(1)
-
-    apk_path = sys.argv[1]
+    apk_path = args.apk_file
 
     if not Path(apk_path).exists():
         console.print(f"[red]✗ APK file not found: {apk_path}[/red]")
@@ -630,8 +685,19 @@ def main():
     if not js_file:
         sys.exit(1)
 
+    console.print("\n[bold][+] Computing APK hash[/bold]")
+    apk_hash = compute_apk_hash(apk_path)
+    console.print(f"[green]✓ SHA256: {apk_hash}[/green]")
+
+    if args.label:
+        console.print(f"[green]✓ Label: {args.label} (source: {args.label_source or 'unspecified'})[/green]")
+
     console.print("\n[bold][+] Running Frida script[/bold]")
-    run_frida_script(device, package_name, js_file, apk_path=apk_path)
+    run_frida_script(
+        device, package_name, js_file,
+        apk_path=apk_path, apk_hash=apk_hash,
+        label=args.label, label_source=args.label_source,
+    )
 
 
 if __name__ == "__main__":

@@ -289,6 +289,20 @@ Java.perform(() => {
 
 console.log('[*] Installing native hooks.');
 
+// prevents frida message-queue overload on high-freq hooks
+const _ipcBuffer: any[] = [];
+const IPC_FLUSH_MS = 300;
+const IPC_MAX_SIZE = 80;
+function bufferedSend(evt: any) {
+    _ipcBuffer.push(evt);
+    if (_ipcBuffer.length >= IPC_MAX_SIZE) flushIpcBuffer();
+}
+function flushIpcBuffer() {
+    if (_ipcBuffer.length === 0) return;
+    send({type: 'batch', events: _ipcBuffer.splice(0)});
+}
+setInterval(flushIpcBuffer, IPC_FLUSH_MS);
+
 const libc = Process.getModuleByName('libc.so');
 if (libc) {
     const file_funcs = ['fopen', 'open'];
@@ -300,13 +314,42 @@ if (libc) {
                     try {
                         const path = args[0].readUtf8String();
                         if (path && !path.includes('/dev/') && !path.includes('/proc/') && !path.includes('/sys/')) {
-                            // console.log(`[native] ${funcName}("${path}")`);
-                            send({type: 'native', func: funcName, path: path, timestamp: Date.now()});
+                            bufferedSend({type: 'native', func: funcName, path: path, timestamp: Date.now()});
                         }
                     } catch (e) {}
                 }
             });
         }
+    }
+
+    // dns hooks 
+    const getaddrinfoPtr = libc.findExportByName('getaddrinfo');
+    if (getaddrinfoPtr) {
+        Interceptor.attach(getaddrinfoPtr, {
+            onEnter: function(args: any) {
+                try {
+                    const host = args[0].readUtf8String();
+                    if (host) {
+                        console.log('[DNS] getaddrinfo: ' + host);
+                        bufferedSend({type: 'network', action: 'dns_resolve', host: host, timestamp: Date.now()});
+                    }
+                } catch (e) {}
+            }
+        });
+    }
+    const gethostbynamePtr = libc.findExportByName('gethostbyname');
+    if (gethostbynamePtr) {
+        Interceptor.attach(gethostbynamePtr, {
+            onEnter: function(args: any) {
+                try {
+                    const host = args[0].readUtf8String();
+                    if (host) {
+                        console.log('[DNS] gethostbyname: ' + host);
+                        bufferedSend({type: 'network', action: 'dns_resolve', host: host, timestamp: Date.now()});
+                    }
+                } catch (e) {}
+            }
+        });
     }
 
     const connectPtr = libc.findExportByName('connect');
@@ -322,7 +365,7 @@ if (libc) {
                         const port = (sockaddr.add(2).readU8() << 8) | sockaddr.add(3).readU8();
                         const ip = sockaddr.add(4).readU8() + '.' + sockaddr.add(5).readU8() + '.' + sockaddr.add(6).readU8() + '.' + sockaddr.add(7).readU8();
                         console.log(`[native] connect(${ip}:${port})`);
-                        send({type: 'network', action: 'connect', ip: ip, port: port, timestamp: Date.now()});
+                        bufferedSend({type: 'network', action: 'connect', ip: ip, port: port, timestamp: Date.now()});
                     } else if (family === 10) { // AF_INET6
                         const port = (sockaddr.add(2).readU8() << 8) | sockaddr.add(3).readU8();
                         let ip = "";
@@ -333,28 +376,52 @@ if (libc) {
                             ip += ((b1 << 8) | b2).toString(16);
                         }
                         console.log(`[native] connect([${ip}]:${port})`);
-                        send({type: 'network', action: 'connect', ip: ip, port: port, timestamp: Date.now()});
+                        bufferedSend({type: 'network', action: 'connect', ip: ip, port: port, timestamp: Date.now()});
                     }
                 } catch (e) {}
             }
         });
     }
 
-    // Network: send/recv
-    const net_funcs = ['send', 'recv', 'sendto', 'recvfrom'];
-    for (const funcName of net_funcs) {
+    // Network: send/recv — capture first 128 bytes of payload for C2 fingerprinting
+    const net_send_funcs = ['send', 'sendto'];
+    for (const funcName of net_send_funcs) {
         const funcPtr = libc.findExportByName(funcName);
         if (funcPtr) {
             Interceptor.attach(funcPtr, {
                 onEnter: function(args: any) {
-                    this.len = args[2].toInt32();
+                    try {
+                        const len = args[2].toInt32();
+                        const preview = len > 0 ? args[1].readByteArray(Math.min(len, 128)) : null;
+                        bufferedSend({type: 'network', action: funcName, bytes: len,
+                            payload_hex: preview ? Array.from(new Uint8Array(preview as ArrayBuffer))
+                                .map((b: number) => b.toString(16).padStart(2,'0')).join('') : null,
+                            timestamp: Date.now()});
+                    } catch (e) {}
+                }
+            });
+        }
+    }
+    const net_recv_funcs = ['recv', 'recvfrom'];
+    for (const funcName of net_recv_funcs) {
+        const funcPtr = libc.findExportByName(funcName);
+        if (funcPtr) {
+            Interceptor.attach(funcPtr, {
+                onEnter: function(args: any) {
+                    this._buf = args[1];
+                    this._maxLen = args[2].toInt32();
                 },
                 onLeave: function(retval: any) {
-                    const ret = retval.toInt32();
-                    if (ret > 0) {
-                        // console.log(`[native] ${funcName} (${ret} bytes)`);
-                        send({type: 'network', action: funcName, bytes: ret, timestamp: Date.now()});
-                    }
+                    try {
+                        const ret = retval.toInt32();
+                        if (ret > 0 && this._buf) {
+                            const preview = this._buf.readByteArray(Math.min(ret, 128));
+                            bufferedSend({type: 'network', action: funcName, bytes: ret,
+                                payload_hex: Array.from(new Uint8Array(preview as ArrayBuffer))
+                                    .map((b: number) => b.toString(16).padStart(2,'0')).join(''),
+                                timestamp: Date.now()});
+                        }
+                    } catch (e) {}
                 }
             });
         }
@@ -370,8 +437,7 @@ if (libssl) {
         if (funcPtr) {
             Interceptor.attach(funcPtr, {
                 onEnter: function(args: any) {
-                    // console.log(`[ssl] ${funcName} called`);
-                    send({type: 'ssl', func: funcName, timestamp: Date.now()});
+                    bufferedSend({type: 'ssl', func: funcName, timestamp: Date.now()});
                 }
             });
         }
@@ -390,7 +456,7 @@ if (libart) {
                 const nMethods = args[3].toInt32();
                 try {
                     console.log(`[JNI] RegisterNatives count=${nMethods}`);
-                    send({type: 'native', action: 'jni_register', count: nMethods, timestamp: Date.now()});
+                    bufferedSend({type: 'native', action: 'jni_register', count: nMethods, timestamp: Date.now()});
                     for (let i = 0; i < nMethods; i++) {
                         const method = methods.add(i * Process.pointerSize * 3);
                         const name = method.readPointer().readUtf8String();
@@ -701,13 +767,32 @@ function installSSLHooksForModule(moduleName: string) {
             if (funcPtr) {
                 Interceptor.attach(funcPtr, {
                     onEnter: function(args: any) {
-                        send({type: 'ssl', func: funcName, module: moduleName, timestamp: Date.now()});
+                        bufferedSend({type: 'ssl', func: funcName, module: moduleName, timestamp: Date.now()});
                     }
                 });
             }
         }
         _hookedNative['ssl_' + moduleName] = true;
         console.log('[+] Late SSL hooks for ' + moduleName);
+    } catch (e) {}
+}
+
+function scanStaticJniExports(libPath: string) {
+    try {
+        const libName = libPath.split('/').pop() as string;
+        if (_hookedNative['jni_scan_' + libName]) return;
+        _hookedNative['jni_scan_' + libName] = true;
+        const mod = Process.findModuleByName(libName);
+        if (!mod) return;
+        const exports = mod.enumerateExports();
+        for (const exp of exports) {
+            if (exp.name && exp.name.startsWith('Java_')) {
+                console.log('[JNI-STATIC] ' + libName + ' exports: ' + exp.name);
+                bufferedSend({type: 'native', action: 'jni_static_export',
+                    library: libName, func: exp.name, ptr: exp.address.toString(),
+                    timestamp: Date.now()});
+            }
+        }
     } catch (e) {}
 }
 
@@ -729,21 +814,19 @@ const _dlopenCallbacks = {
         const path = this._dlopenPath;
         const libName = path.split('/').pop();
 
-        // log all library loads
-        send({type: 'native', action: 'dlopen', path: path, library: libName, timestamp: Date.now()});
+        bufferedSend({type: 'native', action: 'dlopen', path: path, library: libName, timestamp: Date.now()});
+        setTimeout(() => { scanStaticJniExports(path); }, 50);
 
-        // if a new SSL library was loaded, install hooks on it
         if (libName && (libName.indexOf('ssl') !== -1 || libName.indexOf('crypto') !== -1)) {
             console.log('[DLOPEN] SSL-related library loaded: ' + path);
-            setTimeout(() => { installSSLHooksForModule(libName); }, 100);
+            setTimeout(() => { installSSLHooksForModule(libName as string); }, 100);
         }
 
-        // if a suspicious/interesting library is loaded, log it prominently
         const suspicious = ['payload', 'shell', 'exploit', 'inject', 'hack', 'root', 'hide'];
         for (const kw of suspicious) {
             if (libName && libName.toLowerCase().indexOf(kw) !== -1) {
                 console.log('[!] SUSPICIOUS library loaded: ' + path);
-                send({type: 'native', action: 'suspicious_lib', path: path, keyword: kw, timestamp: Date.now()});
+                bufferedSend({type: 'native', action: 'suspicious_lib', path: path, keyword: kw, timestamp: Date.now()});
             }
         }
     }

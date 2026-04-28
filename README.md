@@ -4,8 +4,8 @@ This tool automates the analysis of Android applications (APKs) by detecting use
 
 ## Prerequisites
 
-- **Python 3.8+**
-- **Frida**: `pip install frida-tools`
+- **Python 3.9+**
+- **Latest version of UV**: Required for dependency management.
 - **Node.js & npm**: Required for compiling Frida scripts.
 - **Apktool**: Required for decompiling APKs.
 - **Android Device/Emulator**: Must be running `frida-server`.
@@ -15,7 +15,7 @@ This tool automates the analysis of Android applications (APKs) by detecting use
 1. Clone the repository.
 2. Install Python dependencies:
    ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
 3. Ensure `apktool` and `npm` are in your system PATH.
 

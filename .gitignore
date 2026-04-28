@@ -12,6 +12,7 @@ venv/
 ENV/
 
 # node
+agent/
 node_modules/
 package-lock.json
 *.log
@@ -28,9 +29,8 @@ data/
 output/
 
 # generated hooks
-src/hooks/api_interceptor.js
-src/hooks/generated_hooks.js
-src/hooks/generated_hooks.ts
+src/hooks/*.ts
+src/hooks/*.js
 
 # ide
 .vscode/
@@ -47,3 +47,6 @@ Thumbs.db
 *.tmp
 *.bak
 *.log
+
+# backup files
+backup/
