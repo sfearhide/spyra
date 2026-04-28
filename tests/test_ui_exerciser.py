@@ -53,3 +53,38 @@ def test_adb_cmd_without_serial():
     first_call = mock_run.call_args_list[0].args[0]
     assert first_call[0] == 'adb'
     assert '-s' not in first_call
+
+
+def test_monkey_profile_uses_fixed_seed_and_throttle():
+    ex = UIExerciser('com.example.app', duration=30)
+    with patch('subprocess.run', side_effect=_run) as mock_run:
+        ex._run_monkey_profile(duration_seconds=10)
+    calls = [' '.join(c.args[0]) for c in mock_run.call_args_list]
+    assert any('monkey' in c for c in calls), 'monkey not called'
+    assert any('--seed 42' in c for c in calls)
+    assert any('--throttle 200' in c for c in calls)
+    assert any('com.example.app' in c for c in calls)
+
+
+def test_focused_sweep_sends_tap_and_text():
+    ex = UIExerciser('com.example.app', duration=30)
+    with patch('subprocess.run', side_effect=_run) as mock_run:
+        with patch('src.ui_exerciser.time.sleep'):  # don't actually sleep
+            ex._run_focused_sweep()
+    calls_flat = [' '.join(c.args[0]) for c in mock_run.call_args_list]
+    assert any('input tap' in c for c in calls_flat)
+    assert any('input text' in c for c in calls_flat)
+    assert any('test@example.com' in c for c in calls_flat)
+    assert any('keyevent 66' in c for c in calls_flat)  # Enter
+
+
+def test_start_and_stop():
+    ex = UIExerciser('com.example.app', duration=5)
+    with patch.object(ex, '_run_monkey_profile'):
+        with patch.object(ex, '_run_focused_sweep'):
+            ex.start()
+            assert ex._thread is not None
+            assert ex._thread.is_alive()
+            ex.stop()
+            ex._thread.join(timeout=2)
+            assert not ex._thread.is_alive()
