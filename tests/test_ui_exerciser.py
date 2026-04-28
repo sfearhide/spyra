@@ -1,5 +1,5 @@
 import subprocess
-from unittest.mock import patch, call, MagicMock
+from unittest.mock import patch, call
 import sys
 sys.path.insert(0, '.')
 from src.ui_exerciser import UIExerciser, DANGEROUS_PERMISSIONS
@@ -12,7 +12,7 @@ def _run(args, **kwargs):
 def test_dangerous_permissions_list():
     assert 'android.permission.CAMERA' in DANGEROUS_PERMISSIONS
     assert 'android.permission.RECORD_AUDIO' in DANGEROUS_PERMISSIONS
-    assert len(DANGEROUS_PERMISSIONS) >= 10
+    assert len(DANGEROUS_PERMISSIONS) == 15
 
 
 def test_permission_sweep_calls_adb_for_each_permission():

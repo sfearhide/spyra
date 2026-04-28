@@ -7,8 +7,6 @@ stimulate app logic paths and maximize recorded behavioral events.
 """
 
 import subprocess
-import threading
-import time
 from typing import Optional
 
 DANGEROUS_PERMISSIONS = [
@@ -42,8 +40,6 @@ class UIExerciser:
         self.package_name = package_name
         self.duration = duration
         self.adb_serial = adb_serial
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
 
     # ── ADB helper ──────────────────────────────────────────────────────────
 
@@ -72,7 +68,4 @@ class UIExerciser:
         Failures are silently ignored (app may not declare some permissions).
         """
         for perm in DANGEROUS_PERMISSIONS:
-            try:
-                self._adb("shell", "pm", "grant", self.package_name, perm)
-            except Exception:
-                pass
+            self._adb("shell", "pm", "grant", self.package_name, perm)
