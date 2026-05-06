@@ -14,6 +14,8 @@ from datetime import datetime
 from rich.console import Console
 from urllib.parse import urlparse
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from src.ui_exerciser import UIExerciser
+from src.mitm_controller import MITMController
 
 
 console = Console()
@@ -161,7 +163,6 @@ def extract_domain(url):
 
 
 def compute_apk_hash(apk_path):
-    """Compute SHA256 hash of the APK for dataset integrity and VirusTotal lookup."""
     sha256 = hashlib.sha256()
     with open(apk_path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -170,14 +171,6 @@ def compute_apk_hash(apk_path):
 
 
 def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, label=None, label_source=None):
-    """Save captured sequences with full metadata for LSTM training.
-    
-    Args:
-        label: Ground-truth label (e.g., 'malware', 'benign', or malware family name).
-               If None, saved as 'unlabeled' — must be filled before training.
-        label_source: Where the label came from (e.g., 'virustotal', 'malwarebazaar',
-                      'androzoo', 'manual').
-    """
     output_dir = Path("output") / package_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -637,6 +630,31 @@ def main():
         help="Source of the ground-truth label (e.g., 'virustotal', 'malwarebazaar', "
              "'androzoo', 'manual').",
     )
+    parser.add_argument(
+        "--exerciser",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run structured UI interaction profiles during capture (default: on).",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=120,
+        help="Total capture duration in seconds (default: 120).",
+    )
+    parser.add_argument(
+        "--mitm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run mitmproxy HTTPS capture alongside Frida (default: on).",
+    )
+    parser.add_argument(
+        "--mitm-port",
+        type=int,
+        default=8080,
+        dest="mitm_port",
+        help="Port for the mitmproxy listener (default: 8080).",
+    )
 
     args = parser.parse_args()
 
@@ -692,12 +710,61 @@ def main():
     if args.label:
         console.print(f"[green]✓ Label: {args.label} (source: {args.label_source or 'unspecified'})[/green]")
 
+    adb_serial = getattr(device, 'id', None)
+    if adb_serial and not adb_serial.startswith('emulator') and ':' not in adb_serial:
+        adb_serial = None
+
+    if args.exerciser:
+        console.print("\n[bold][+] Granting permissions[/bold]")
+        exerciser = UIExerciser(package_name, duration=args.duration, adb_serial=adb_serial)
+        exerciser.permission_sweep()
+        console.print("[green]✓ Permission sweep complete[/green]")
+    else:
+        exerciser = None
+
+    mitm = None
+    if args.mitm:
+        console.print("\n[bold][+] Starting MITM proxy[/bold]")
+        mitm = MITMController(
+            output_dir=str(Path("output") / package_name),
+            adb_serial=adb_serial,
+            port=args.mitm_port,
+        )
+        
+        if mitm.is_available():
+            ok = mitm.start()
+            
+            if ok:
+                console.print(f"[green]✓ mitmdump running on port {args.mitm_port}[/green]")
+            else:
+                console.print("[yellow]mitmdump failed to start — MITM capture disabled[/yellow]")
+                mitm = None
+        
+        else:
+            console.print(
+                "[yellow]mitmdump not found — install with: pip install mitmproxy. "
+                "MITM capture disabled.[/yellow]"
+            )
+            mitm = None
+
     console.print("\n[bold][+] Running Frida script[/bold]")
+    session_start_time = time.time()
     run_frida_script(
         device, package_name, js_file,
         apk_path=apk_path, apk_hash=apk_hash,
         label=args.label, label_source=args.label_source,
+        exerciser=exerciser,
+        duration=args.duration,
     )
+
+    if mitm:
+        console.print("\n[bold][+] Stopping MITM proxy[/bold]")
+        mitm.stop()
+        
+        net_file = Path("output") / package_name / f"{package_name}_network_sequence.json"
+        if net_file.exists():
+            mitm.merge_into_network_sequence(str(net_file), session_start_time)
+            console.print(f"[green]✓ MITM flows merged into {net_file.name}[/green]")
 
 
 if __name__ == "__main__":

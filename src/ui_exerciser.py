@@ -31,8 +31,6 @@ DANGEROUS_PERMISSIONS = [
 
 
 class UIExerciser:
-    """Runs structured ADB interaction profiles alongside a Frida session."""
-
     def __init__(
         self,
         package_name: str,
@@ -45,7 +43,6 @@ class UIExerciser:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-    # ── ADB helper ──────────────────────────────────────────────────────────
 
     def _adb(self, *args, timeout: int = 30) -> subprocess.CompletedProcess:
         """Run an adb command, returning CompletedProcess. Never raises."""
@@ -63,22 +60,18 @@ class UIExerciser:
         except Exception:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
 
-    # ── Profile 1: Permission sweep ─────────────────────────────────────────
 
     def permission_sweep(self) -> None:
         """Grant all dangerous permissions before the app activates.
-
-        Call this synchronously before Frida resumes the process.
-        Failures are silently ignored (app may not declare some permissions).
+        (call it synchronously before Frida resumes the process) failures are silently ignored.
         """
         for perm in DANGEROUS_PERMISSIONS:
             self._adb("shell", "pm", "grant", self.package_name, perm)
 
-    # ── Profile 2: Structured monkey ────────────────────────────────────────
 
     def _run_monkey_profile(self, duration_seconds: int = 60) -> None:
         """Run adb monkey with fixed seed and weighted event distribution."""
-        n_events = max(1, duration_seconds * 1000 // 200)  # 200ms throttle
+        n_events = max(1, duration_seconds * 1000 // 200) 
         self._adb(
             "shell", "monkey",
             "-p", self.package_name,
@@ -96,16 +89,14 @@ class UIExerciser:
             timeout=duration_seconds + 10,
         )
 
-    # ── Profile 3: Focused interaction sweep ────────────────────────────────
 
     def _run_focused_sweep(self) -> None:
-        """Tap common UI positions, enter dummy credentials, navigate."""
         taps = [
             (540, 960),   # center
-            (270, 480),   # top-left quadrant
-            (810, 480),   # top-right quadrant
-            (270, 1440),  # bottom-left quadrant
-            (810, 1440),  # bottom-right quadrant
+            (270, 480),   # top-left
+            (810, 480),   # top-right
+            (270, 1440),  # bottom-left
+            (810, 1440),  # bottom-right
         ]
         for x, y in taps:
             if self._stop_event.is_set():
@@ -113,25 +104,23 @@ class UIExerciser:
             self._adb("shell", "input", "tap", str(x), str(y))
             time.sleep(0.3)
 
-        # Enter dummy credentials
+        # test dummy credentials
         self._adb("shell", "input", "text", "test@example.com")
-        self._adb("shell", "input", "keyevent", "66")   # Enter
+        self._adb("shell", "input", "keyevent", "66")
         time.sleep(0.5)
         self._adb("shell", "input", "text", "Password123!")
-        self._adb("shell", "input", "keyevent", "66")   # Enter
+        self._adb("shell", "input", "keyevent", "66")
         time.sleep(0.5)
 
-        # Tap center (confirm/login button)
         self._adb("shell", "input", "tap", "540", "960")
         time.sleep(1.0)
 
-        # Back → Home → re-launch
-        self._adb("shell", "input", "keyevent", "4")    # Back
+        # relauch
+        self._adb("shell", "input", "keyevent", "4")
         time.sleep(0.5)
-        self._adb("shell", "input", "keyevent", "3")    # Home
+        self._adb("shell", "input", "keyevent", "3")
         time.sleep(5.0)
 
-        # Re-launch best-effort
         self._adb(
             "shell", "am", "start",
             "-a", "android.intent.action.MAIN",
@@ -140,32 +129,28 @@ class UIExerciser:
         )
         time.sleep(2.0)
 
-        # Tap center again (dismiss any dialog)
         self._adb("shell", "input", "tap", "540", "960")
 
-    # ── Threading ───────────────────────────────────────────────────────────
 
     def _run(self) -> None:
-        """Background thread: run monkey then focused sweep."""
-        # Brief settle time before monkey (Frida needs to hook first)
         if self._stop_event.wait(timeout=2.0):
             return
 
-        # Profile 2: monkey (60s of the total duration)
         monkey_duration = min(60, max(10, self.duration - 40))
         self._run_monkey_profile(duration_seconds=monkey_duration)
 
         if self._stop_event.is_set():
             return
 
-        # Profile 3: focused sweep (~30s)
         self._run_focused_sweep()
+
 
     def start(self) -> None:
         """Start the exerciser in a background daemon thread."""
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name="UIExerciser")
         self._thread.start()
+
 
     def stop(self) -> None:
         """Signal the exerciser to stop and wait briefly for thread exit."""

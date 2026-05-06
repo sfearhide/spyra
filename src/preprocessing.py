@@ -10,17 +10,6 @@ review:
   2. Strategy for variable-length string fields (hash/truncate/discard)
   3. Normalization for timestamp / relative_time fields
   4. Defined sequence-length window (sliding window of N events)
-
-Usage:
-    python -m src.preprocessing output/com.example.app/
-    python -m src.preprocessing output/ --window 200 --stride 50
-
-Output:
-    <input_dir>_preprocessed/
-        sequences.npy    — (N_windows, window_size, feature_dim) float32
-        labels.npy       — (N_windows,) int32  (0=benign, 1=malware)
-        vocab.json       — token-to-index mapping
-        metadata.json    — preprocessing parameters for reproducibility
 """
 
 import json
@@ -101,7 +90,6 @@ def extract_features(event: dict, vocab: Vocabulary, max_time: float) -> np.ndar
     key = build_event_key(event)
     features[0] = float(vocab.encode(key))
 
-    # relative time
     rel_time = event.get("relative_time", 0.0)
     features[1] = min(rel_time / max_time, 1.0) if max_time > 0 else 0.0
 
@@ -126,7 +114,7 @@ def extract_features(event: dict, vocab: Vocabulary, max_time: float) -> np.ndar
 
     features[8] = 1.0 if event.get("is_exec") or event.get("action") == "mprotect_exec" else 0.0 # is executable protection
 
-    # sequence position
+    # sequence pos
     seq = event.get("seq", 0)
     try:
         features[9] = min(float(seq) / 10000.0, 1.0)
@@ -231,14 +219,17 @@ def preprocess_directory(
 
     for api_file in api_files:
         net_file = api_file.parent / api_file.name.replace("_api_sequence.json", "_network_sequence.json")
+        
         if not net_file.exists():
             print(f"[!] Missing network sequence for {api_file.name}, skipping")
             continue
+        
         try:
             windows, label, meta = preprocess_capture(api_file, net_file, vocab, config)
             if windows.shape[0] > 0:
                 all_windows.append(windows)
                 all_labels.extend([label] * windows.shape[0])
+                
                 sample_metadata.append({
                     "file": str(api_file),
                     "package": meta.get("package_name", ""),
@@ -272,8 +263,10 @@ def preprocess_directory(
 
     np.save(output_dir / "sequences.npy", X)
     np.save(output_dir / "labels.npy", y)
+    
     with open(output_dir / "vocab.json", "w") as f:
         json.dump(vocab.to_dict(), f, indent=2)
+    
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(pipeline_meta, f, indent=2, default=str)
 

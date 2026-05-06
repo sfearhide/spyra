@@ -18,20 +18,17 @@ MAX_BODY_BYTES = 8192
 
 
 class SpyraAddon:
-    """mitmproxy addon that writes flow records to a JSONL file."""
-
     def __init__(self, flows_file: str):
         self._flows_file = Path(flows_file)
         self._flows_file.parent.mkdir(parents=True, exist_ok=True)
 
     def response(self, flow) -> None:
-        """Called by mitmproxy after a full response is received."""
         try:
-            # Request body preview
+            # req body preview
             req_body_raw = flow.request.content or b""
             req_preview = req_body_raw[:MAX_BODY_BYTES].decode("utf-8", errors="replace")
 
-            # Response body preview
+            # response body preview
             resp_body_raw = flow.response.content or b""
             resp_preview = resp_body_raw[:MAX_BODY_BYTES].decode("utf-8", errors="replace")
 
@@ -46,15 +43,12 @@ class SpyraAddon:
                 "request_body_preview": req_preview,
                 "response_body_preview": resp_preview,
             }
-
             with open(self._flows_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
-
         except Exception:
-            pass  # Never crash mitmproxy
+            pass
 
 
-# mitmproxy entry point — called when loaded with mitmdump -s
 def load(loader):
     loader.add_option("flows_file", str, "/tmp/mitm_flows.jsonl", "Path to JSONL output file")
 
@@ -63,10 +57,8 @@ def configure(updated):
     pass
 
 
-# Module-level addon instance created by mitmproxy
 class _MitmproxyAddon(SpyraAddon):
     def __init__(self):
-        # flows_file will be set via mitmproxy options after load()
         super().__init__("/tmp/mitm_flows.jsonl")
 
     def configure(self, updated):

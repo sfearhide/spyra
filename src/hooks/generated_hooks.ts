@@ -22,6 +22,14 @@ Process.setExceptionHandler(function(details: any) {
     return true; // suppress the exception, keep the process alive
 });
 
+const _origFridaSend = send;
+(globalThis as any).send = function(payload: any, data?: any) {
+    if (typeof payload === 'object' && payload !== null) {
+        payload.thread_id = Process.getCurrentThreadId();
+    }
+    _origFridaSend(payload, data !== undefined ? data : null);
+};
+
 // safe hook wrapper; catches errors per-hook so one
 // failing hook does not prevent others from installing
 function safeJavaHook(className: string, methodName: string, hookFn: (cls: any) => void) {
@@ -67,7 +75,6 @@ function safeNativeHook(moduleName: string, funcName: string, callbacks: any) {
     try {
         const mod = Process.findModuleByName(moduleName);
         if (!mod) {
-            // module not yet loaded, will be caught by dlopen watcher
             return false;
         }
         const funcPtr = mod.findExportByName(funcName);
@@ -83,8 +90,26 @@ function safeNativeHook(moduleName: string, funcName: string, callbacks: any) {
     }
 }
 
+function captureBacktrace(ctx: any): string[] {
+    try {
+        const bt = Thread.backtrace(ctx, Backtracer.ACCURATE);
+        return bt.map(DebugSymbol.fromAddress).map((s: any) => s.toString());
+    } catch (e) {
+        return [];
+    }
+}
+
 const _hookedNative: any = {};  // track which native funcs we already hooked
 const _hookedClasses: any = {}; // track which Java classes we already hooked
+
+// thread-aware send wrapper — injects thread_id into every event
+// so the LSTM can model per-thread behavioral sequences
+function tsend(payload: any, data?: ArrayBuffer | null) {
+    if (typeof payload === 'object' && payload !== null) {
+        payload.thread_id = Process.getCurrentThreadId();
+    }
+    send(payload, data);
+}
 
 // ============================================================
 // anti-detection bypass: Root, Frida, and SSL pinning
@@ -123,7 +148,7 @@ Java.perform(() => {
             console.log('[BYPASS] exec blocked: ' + cmdStr);
             send({type: 'bypass', action: 'exec_block', command: cmdStr, timestamp: Date.now()});
         }
-        send({type: 'exec', action: 'runtime_exec', command: cmdStr, timestamp: Date.now()});
+        send({type: 'exec', action: 'runtime_exec', command: cmdStr, backtrace: [], timestamp: Date.now()});
     });
 
     // apps detect frida by scanning /proc/self/maps for frida-agent, checking
@@ -133,15 +158,17 @@ Java.perform(() => {
     safeJavaHook('java.io.BufferedReader', 'readLine', (cls: any) => {
         const origReadLine = cls.readLine.overloads[0];
         origReadLine.implementation = function() {
-            const line = origReadLine.call(this);
-            if (line !== null) {
+            let line = origReadLine.call(this);
+            while (line !== null) {
                 const lineStr = line.toString();
                 if (lineStr.indexOf('frida') !== -1 || lineStr.indexOf('gadget') !== -1 ||
                     lineStr.indexOf('gmain') !== -1 || lineStr.indexOf('linjector') !== -1) {
                     console.log('[BYPASS] /proc/maps frida detection line hidden');
                     send({type: 'bypass', action: 'frida_maps_hide', timestamp: Date.now()});
-                    return origReadLine.call(this);
+                    line = origReadLine.call(this);  // read next, non-recursively
+                    continue;
                 }
+                break;
             }
             return line;
         };
@@ -180,7 +207,6 @@ Java.perform(() => {
         console.log('[-] SSL pinning bypass: ' + e);
     }
 
-    // bypass android NetworkSecurityConfig for API 24+
     try {
         const NetworkSecurityConfig = Java.use('android.security.net.config.NetworkSecurityConfig');
         if (NetworkSecurityConfig.isCleartextTrafficPermitted) {
@@ -275,11 +301,28 @@ Java.perform(() => {
         } catch (e) {}
     });
 
+    // DNS-over-HTTPS (DoH) endpoint list for detection
+    const DOH_ENDPOINTS = [
+        'dns.google', 'dns.google.com', 'cloudflare-dns.com',
+        '1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4',
+        'dns.quad9.net', 'doh.opendns.com', 'dns.adguard.com'
+    ];
+
     hookAllOverloads('java.net.URL', '$init', (args: any[]) => {
         try {
             if (args.length >= 1) {
                 const url = '' + args[0];
                 send({type: 'network', action: 'url_init', url: url, timestamp: Date.now()});
+                // DoH detection: flag DNS-over-HTTPS requests that bypass native DNS hooks
+                for (const endpoint of DOH_ENDPOINTS) {
+                    if (url.indexOf(endpoint) !== -1 &&
+                        (url.indexOf('/dns-query') !== -1 || url.indexOf('/resolve') !== -1)) {
+                        console.log('[!!! DoH] DNS-over-HTTPS detected: ' + url);
+                        send({type: 'network', action: 'doh_request', url: url,
+                              endpoint: endpoint, timestamp: Date.now()});
+                        break;
+                    }
+                }
             }
         } catch (e) {}
     });
@@ -294,6 +337,7 @@ const _ipcBuffer: any[] = [];
 const IPC_FLUSH_MS = 300;
 const IPC_MAX_SIZE = 80;
 function bufferedSend(evt: any) {
+    evt.thread_id = Process.getCurrentThreadId();
     _ipcBuffer.push(evt);
     if (_ipcBuffer.length >= IPC_MAX_SIZE) flushIpcBuffer();
 }
@@ -313,7 +357,20 @@ if (libc) {
                 onEnter: function(args: any) {
                     try {
                         const path = args[0].readUtf8String();
-                        if (path && !path.includes('/dev/') && !path.includes('/proc/') && !path.includes('/sys/')) {
+                        if (!path) return;
+                        // filter /dev/ and /sys/ (pure noise)
+                        if (path.includes('/dev/') || path.includes('/sys/')) return;
+
+                        if (path.includes('/proc/')) {
+                            bufferedSend({
+                                type: 'native', func: funcName, path: path,
+                                action: 'proc_probe',
+                                is_maps: path.includes('/proc/self/maps'),
+                                is_net: path.includes('/proc/net/'),
+                                is_status: path.includes('/proc/self/status'),
+                                timestamp: Date.now()
+                            });
+                        } else {
                             bufferedSend({type: 'native', func: funcName, path: path, timestamp: Date.now()});
                         }
                     } catch (e) {}
@@ -365,7 +422,8 @@ if (libc) {
                         const port = (sockaddr.add(2).readU8() << 8) | sockaddr.add(3).readU8();
                         const ip = sockaddr.add(4).readU8() + '.' + sockaddr.add(5).readU8() + '.' + sockaddr.add(6).readU8() + '.' + sockaddr.add(7).readU8();
                         console.log(`[native] connect(${ip}:${port})`);
-                        bufferedSend({type: 'network', action: 'connect', ip: ip, port: port, timestamp: Date.now()});
+                        const bt = captureBacktrace(this.context);
+                        bufferedSend({type: 'network', action: 'connect', ip: ip, port: port, backtrace: bt, timestamp: Date.now()});
                     } else if (family === 10) { // AF_INET6
                         const port = (sockaddr.add(2).readU8() << 8) | sockaddr.add(3).readU8();
                         let ip = "";
@@ -376,14 +434,15 @@ if (libc) {
                             ip += ((b1 << 8) | b2).toString(16);
                         }
                         console.log(`[native] connect([${ip}]:${port})`);
-                        bufferedSend({type: 'network', action: 'connect', ip: ip, port: port, timestamp: Date.now()});
+                        const bt = captureBacktrace(this.context);
+                        bufferedSend({type: 'network', action: 'connect', ip: ip, port: port, backtrace: bt, timestamp: Date.now()});
                     }
                 } catch (e) {}
             }
         });
     }
 
-    // Network: send/recv — capture first 128 bytes of payload for C2 fingerprinting
+    // capture first 128 bytes of payload for C2 fingerprinting
     const net_send_funcs = ['send', 'sendto'];
     for (const funcName of net_send_funcs) {
         const funcPtr = libc.findExportByName(funcName);
@@ -428,25 +487,232 @@ if (libc) {
     }
 }
 
-// SSL hooks
-const ssl_functions = ['SSL_read', 'SSL_write', 'SSL_connect'];
-const libssl = Process.getModuleByName('libssl.so');
-if (libssl) {
-    for (const funcName of ssl_functions) {
-        const funcPtr = libssl.findExportByName(funcName);
-        if (funcPtr) {
-            Interceptor.attach(funcPtr, {
+// PROT_EXEC = 0x4, PROT_WRITE = 0x2, PROT_READ = 0x1
+if (libc) {
+    const PROT_EXEC = 0x4;
+    
+    // Track anonymous mmap allocations; only emit when mprotect makes them executable
+    const _mmapTracker: any = {};  // address -> {length, prot, flags, fd, timestamp, bt}
+
+    const mmapPtr = libc.findExportByName('mmap');
+    if (mmapPtr) {
+        Interceptor.attach(mmapPtr, {
+            onEnter: function(args: any) {
+                this._addr = args[0];
+                this._len = args[1].toInt32();
+                this._prot = args[2].toInt32();
+                this._flags = args[3].toInt32();
+                this._fd = args[4].toInt32();
+            },
+            onLeave: function(retval: any) {
+                try {
+                    const prot = this._prot;
+                    const MAP_ANONYMOUS = 0x20;
+                    const isExec = (prot & PROT_EXEC) !== 0;
+                    const isAnon = (this._flags & MAP_ANONYMOUS) !== 0;
+                    
+                    // Immediately report mmap with EXEC — direct shellcode allocation
+                    if (isExec) {
+                        const protStr = ((prot & 1) ? 'R' : '-') + ((prot & 2) ? 'W' : '-') + ((prot & 4) ? 'X' : '-');
+                        const bt = captureBacktrace(this.context);
+                        bufferedSend({
+                            type: 'native', action: 'mmap_exec',
+                            address: retval.toString(),
+                            length: this._len,
+                            prot: protStr,
+                            prot_raw: prot,
+                            flags: this._flags,
+                            fd: this._fd,
+                            is_anonymous: isAnon,
+                            backtrace: bt,
+                            timestamp: Date.now()
+                        });
+                        console.log('[!] mmap with EXEC prot=' + protStr + ' len=' + this._len + ' addr=' + retval);
+                    }
+                    
+                    // Track anonymous writable allocations for later mprotect correlation
+                    if (isAnon && this._len > 4096 && !isExec) {
+                        const addrKey = retval.toString();
+                        _mmapTracker[addrKey] = {
+                            length: this._len,
+                            prot: prot,
+                            flags: this._flags,
+                            timestamp: Date.now()
+                        };
+                        // Limit tracker size to prevent memory leak
+                        const keys = Object.keys(_mmapTracker);
+                        if (keys.length > 500) {
+                            delete _mmapTracker[keys[0]];
+                        }
+                    }
+                } catch (e) {}
+            }
+        });
+        console.log('[+] mmap hook installed');
+    }
+
+    const mprotectPtr = libc.findExportByName('mprotect');
+    if (mprotectPtr) {
+        Interceptor.attach(mprotectPtr, {
+            onEnter: function(args: any) {
+                try {
+                    const addr = args[0];
+                    const len = args[1].toInt32();
+                    const prot = args[2].toInt32();
+                    // Alert on any transition TO executable protection
+                    if ((prot & PROT_EXEC) !== 0) {
+                        const protStr = ((prot & 1) ? 'R' : '-') + ((prot & 2) ? 'W' : '-') + ((prot & 4) ? 'X' : '-');
+                        const bt = captureBacktrace(this.context);
+                        const addrStr = addr.toString();
+                        
+                        // Check if this was a tracked anonymous mmap (RW->RWX pattern = shellcode)
+                        const mmapInfo = _mmapTracker[addrStr];
+                        const wasAnonymous = !!mmapInfo;
+                        
+                        console.log('[!!! MPROTECT] Making memory executable: addr=' + addr + ' len=' + len + ' prot=' + protStr +
+                            (wasAnonymous ? ' [SUSPICIOUS: prev anon mmap]' : ''));
+                        send({
+                            type: 'native', action: 'mprotect_exec',
+                            address: addrStr,
+                            length: len,
+                            prot: protStr,
+                            prot_raw: prot,
+                            was_anonymous_mmap: wasAnonymous,
+                            original_mmap_size: mmapInfo ? mmapInfo.length : null,
+                            backtrace: bt,
+                            timestamp: Date.now()
+                        });
+                        
+                        if (wasAnonymous) {
+                            delete _mmapTracker[addrStr];
+                        }
+                    }
+                } catch (e) {}
+            }
+        });
+        console.log('[+] mprotect hook installed');
+    }
+}
+
+if (libc) {
+    const ptracePtr = libc.findExportByName('ptrace');
+    if (ptracePtr) {
+        Interceptor.attach(ptracePtr, {
+            onEnter: function(args: any) {
+                this._request = args[0].toInt32();
+            },
+            onLeave: function(retval: any) {
+                try {
+                    const PTRACE_TRACEME = 0;
+                    if (this._request === PTRACE_TRACEME) {
+                        // return 0 (success) to make malware think it self-traced
+                        retval.replace(ptr(0));
+                        console.log('[BYPASS] ptrace(PTRACE_TRACEME) spoofed -> 0');
+                        send({
+                            type: 'bypass', action: 'ptrace_traceme',
+                            original_retval: retval.toInt32(),
+                            timestamp: Date.now()
+                        });
+                    } else {
+                        send({
+                            type: 'native', action: 'ptrace',
+                            request: this._request,
+                            timestamp: Date.now()
+                        });
+                    }
+                } catch (e) {}
+            }
+        });
+        console.log('[+] ptrace anti-debug bypass installed');
+    }
+}
+
+function installSSLPayloadHooks(moduleName: string) {
+    const hookKey = 'ssl_payload_' + moduleName;
+    if (_hookedNative[hookKey]) return;
+    try {
+        const mod = Process.findModuleByName(moduleName);
+        if (!mod) return;
+
+        const sslReadPtr = mod.findExportByName('SSL_read');
+        if (sslReadPtr) {
+            Interceptor.attach(sslReadPtr, {
                 onEnter: function(args: any) {
-                    bufferedSend({type: 'ssl', func: funcName, timestamp: Date.now()});
+                    this._ssl = args[0];
+                    this._buf = args[1];
+                    this._num = args[2].toInt32();
+                },
+                onLeave: function(retval: any) {
+                    try {
+                        const bytesRead = retval.toInt32();
+                        if (bytesRead > 0 && this._buf) {
+                            const preview = this._buf.readByteArray(Math.min(bytesRead, 4096));
+                            bufferedSend({
+                                type: 'ssl', func: 'SSL_read', module: moduleName,
+                                bytes: bytesRead,
+                                payload_hex: preview ? Array.from(new Uint8Array(preview as ArrayBuffer))
+                                    .map((b: number) => b.toString(16).padStart(2, '0')).join('') : null,
+                                timestamp: Date.now()
+                            });
+                        }
+                    } catch (e) {}
+                }
+            });
+            console.log('[+] SSL_read payload hook: ' + moduleName);
+        }
+
+        const sslWritePtr = mod.findExportByName('SSL_write');
+        if (sslWritePtr) {
+            Interceptor.attach(sslWritePtr, {
+                onEnter: function(args: any) {
+                    try {
+                        const num = args[2].toInt32();
+                        if (num > 0) {
+                            const preview = args[1].readByteArray(Math.min(num, 4096));
+                            bufferedSend({
+                                type: 'ssl', func: 'SSL_write', module: moduleName,
+                                bytes: num,
+                                payload_hex: preview ? Array.from(new Uint8Array(preview as ArrayBuffer))
+                                    .map((b: number) => b.toString(16).padStart(2, '0')).join('') : null,
+                                timestamp: Date.now()
+                            });
+                        }
+                    } catch (e) {}
+                }
+            });
+            console.log('[+] SSL_write payload hook: ' + moduleName);
+        }
+
+        const sslConnectPtr = mod.findExportByName('SSL_connect');
+        if (sslConnectPtr) {
+            Interceptor.attach(sslConnectPtr, {
+                onEnter: function(args: any) {
+                    bufferedSend({type: 'ssl', func: 'SSL_connect', module: moduleName, timestamp: Date.now()});
                 }
             });
         }
+
+        _hookedNative[hookKey] = true;
+        console.log('[+] SSL payload hooks installed for: ' + moduleName);
+    } catch (e) {
+        console.log('[-] SSL payload hooks failed for ' + moduleName + ': ' + e);
     }
+}
+
+const SSL_MODULE_CANDIDATES = ['libssl.so', 'libboringssl.so', 'libconscrypt_jni.so'];
+for (const sslMod of SSL_MODULE_CANDIDATES) {
+    installSSLPayloadHooks(sslMod);
 }
 
 const libart = Process.findModuleByName('libart.so');
 if (libart) {
-    const RegisterNatives = libart.enumerateSymbols().find((s: any) => s.name.includes('RegisterNatives'));
+    const registerNativesPatterns = ['RegisterNatives', '_ZN3art3JNI15RegisterNativesE', 'jni_RegisterNatives'];
+    let RegisterNatives: any = null;
+    const symbols = libart.enumerateSymbols();
+    for (const pattern of registerNativesPatterns) {
+        RegisterNatives = symbols.find((s: any) => s.name.includes(pattern) && s.type === 'function');
+        if (RegisterNatives) break;
+    }
     if (RegisterNatives) {
         Interceptor.attach(RegisterNatives.address, {
             onEnter: function(args: any) {
@@ -456,12 +722,16 @@ if (libart) {
                 const nMethods = args[3].toInt32();
                 try {
                     console.log(`[JNI] RegisterNatives count=${nMethods}`);
-                    bufferedSend({type: 'native', action: 'jni_register', count: nMethods, timestamp: Date.now()});
+                    const bt = captureBacktrace(this.context);
+                    bufferedSend({type: 'native', action: 'jni_register', count: nMethods, backtrace: bt, timestamp: Date.now()});
+
+                    const ptrSize = Process.pointerSize;
+                    const structSize = ptrSize * 3;
                     for (let i = 0; i < nMethods; i++) {
-                        const method = methods.add(i * Process.pointerSize * 3);
-                        const name = method.readPointer().readUtf8String();
-                        const sig = method.add(Process.pointerSize).readPointer().readUtf8String();
-                        const fnPtr = method.add(Process.pointerSize * 2).readPointer();
+                        const methodBase = methods.add(i * structSize);
+                        const name = methodBase.readPointer().readUtf8String();
+                        const sig = methodBase.add(ptrSize).readPointer().readUtf8String();
+                        const fnPtr = methodBase.add(ptrSize * 2).readPointer();
                         
                         console.log(`  - ${name}${sig} -> ${fnPtr}`);
                         send({
@@ -470,6 +740,7 @@ if (libart) {
                             method: name, 
                             sig: sig, 
                             ptr: fnPtr.toString(),
+                            arch: Process.arch,
                             timestamp: Date.now()
                         });
                     }
@@ -478,22 +749,152 @@ if (libart) {
                 }
             }
         });
+        console.log('[+] RegisterNatives hook (arch=' + Process.arch + ', ptrSize=' + Process.pointerSize + ')');
+    }
+}
+
+
+const _stalkerCallBuffer: any[] = [];
+const STALKER_FLUSH_INTERVAL = 2000;   // flush every 2s
+const STALKER_MAX_BUFFER = 500;
+let _stalkerActive = false;
+
+function flushStalkerBuffer() {
+    if (_stalkerCallBuffer.length === 0) return;
+    const events = _stalkerCallBuffer.splice(0, STALKER_MAX_BUFFER);
+    send({
+        type: 'stalker',
+        action: 'call_graph',
+        count: events.length,
+        events: events,
+        timestamp: Date.now()
+    });
+}
+
+function startStalker(threadId: number) {
+    if (_stalkerActive) return;
+    try {
+        Stalker.follow(threadId, {
+            events: {
+                call: true,    // capture CALL instructions
+                ret: false,    // skip returns (too noisy for LSTM)
+                exec: false,   // skip basic blocks
+                block: false,  // skip block compilation
+                compile: false
+            },
+            onCallSummary: function(summary: any) {
+                try {
+                    for (const target in summary) {
+                        const addr = ptr(target);
+                        const sym = DebugSymbol.fromAddress(addr);
+                        const moduleName = sym.moduleName || '';
+                        const funcName = sym.name || '';
+
+                        // filter out noise: only log calls to known libraries and non-trivial call counts
+                        if (summary[target] > 0 && moduleName) {
+                            _stalkerCallBuffer.push({
+                                address: target,
+                                module: moduleName,
+                                func: funcName,
+                                count: summary[target]
+                            });
+                        }
+                    }
+                    if (_stalkerCallBuffer.length >= STALKER_MAX_BUFFER) {
+                        flushStalkerBuffer();
+                    }
+                } catch (e) {}
+            }
+        });
+        _stalkerActive = true;
+        console.log('[+] Stalker following thread ' + threadId + ' (arch=' + Process.arch + ')');
+        setInterval(flushStalkerBuffer, STALKER_FLUSH_INTERVAL);
+    } catch (e) {
+        console.log('[-] Stalker failed: ' + e);
+        console.log('    Stalker requires arm64 or x86_64. Current arch: ' + Process.arch);
+    }
+}
+
+// Start Stalker on the app's main thread (not Frida's script thread).
+// Use Java.perform to get the app's UI thread ID.
+setTimeout(() => {
+    try {
+        Java.perform(() => {
+            try {
+                const Looper = Java.use('android.os.Looper');
+                const mainLooper = Looper.getMainLooper();
+                const mainThread = mainLooper.getThread();
+                const appMainTid = mainThread.getId();
+                console.log('[*] App main thread ID: ' + appMainTid);
+                // Frida Stalker needs the OS-level TID, not the Java thread ID.
+                // Enumerate threads to find the matching one.
+                const threads = Process.enumerateThreads();
+                let targetTid = threads[0].id;  // fallback: first thread (usually main)
+                // The main thread is typically the one with the lowest TID
+                // or we can match by iterating
+                for (const t of threads) {
+                    if (t.id === appMainTid) {
+                        targetTid = t.id;
+                        break;
+                    }
+                }
+                // Use the first thread as a reasonable approximation of app main thread
+                // since Java thread IDs don't always map 1:1 to OS TIDs
+                startStalker(threads[0].id);
+            } catch (e) {
+                console.log('[-] Could not determine app main thread: ' + e);
+                // Fallback: use first enumerated thread
+                const threads = Process.enumerateThreads();
+                if (threads.length > 0) {
+                    startStalker(threads[0].id);
+                }
+            }
+        });
+    } catch (e) {
+        console.log('[-] Could not start Stalker: ' + e);
+    }
+}, 3000);
+
+// Hook pthread_create to detect new threads from suspicious modules
+if (libc) {
+    const pthreadCreatePtr = libc.findExportByName('pthread_create');
+    if (pthreadCreatePtr) {
+        Interceptor.attach(pthreadCreatePtr, {
+            onEnter: function(args: any) {
+                try {
+                    const startRoutine = args[2];
+                    const sym = DebugSymbol.fromAddress(startRoutine);
+                    const moduleName = sym.moduleName || '';
+                    // Flag threads started from non-system modules or anonymous memory
+                    if (moduleName && moduleName.indexOf('lib') === 0 &&
+                        moduleName.indexOf('libc.so') === -1 &&
+                        moduleName.indexOf('libart.so') === -1 &&
+                        moduleName.indexOf('libandroid_runtime.so') === -1) {
+                        bufferedSend({
+                            type: 'native', action: 'pthread_create',
+                            start_routine: startRoutine.toString(),
+                            module: moduleName,
+                            func: sym.name || '',
+                            timestamp: Date.now()
+                        });
+                    }
+                } catch (e) {}
+            }
+        });
+        console.log('[+] pthread_create watcher');
     }
 }
 
 console.log('[*] Native hooks installed. Interact with the app to see activity.');
 
 console.log('[*] Installing Crypto hooks.');
-Java.perform(() => {
-    // Hook ALL overloads of Cipher.doFinal - not just [B
-    // Obfuscated apps may call different overloads
+Java.perform(() => { 
     hookAllOverloads('javax.crypto.Cipher', 'doFinal', (args: any[], method: string, sig: string) => {
         try {
             send({type: 'crypto', action: 'cipher_dofinal', overload: sig, timestamp: Date.now()});
         } catch (e) {}
     });
 
-    // Hook Cipher.getInstance to capture the transformation/algorithm
     hookAllOverloads('javax.crypto.Cipher', 'getInstance', (args: any[], method: string, sig: string) => {
         try {
             const transformation = '' + args[0];
@@ -502,7 +903,6 @@ Java.perform(() => {
         } catch (e) {}
     });
 
-    // Hook ALL overloads of MessageDigest.digest
     hookAllOverloads('java.security.MessageDigest', 'digest', (args: any[], method: string, sig: string) => {
         try {
             send({type: 'crypto', action: 'digest', overload: sig, timestamp: Date.now()});
@@ -517,7 +917,7 @@ Java.perform(() => {
         } catch (e) {}
     });
 
-    // SecretKeySpec - captures encryption keys being created
+    // captures encryption keys being created
     hookAllOverloads('javax.crypto.spec.SecretKeySpec', '$init', (args: any[], method: string, sig: string) => {
         try {
             const algo = '' + args[1];
@@ -526,7 +926,6 @@ Java.perform(() => {
         } catch (e) {}
     });
 
-    // KeyGenerator
     hookAllOverloads('javax.crypto.KeyGenerator', 'getInstance', (args: any[], method: string, sig: string) => {
         try {
             const algo = '' + args[0];
@@ -540,7 +939,7 @@ Java.perform(() => {
 
 console.log('[*] Installing Android API hooks.');
 Java.perform(() => {
-    // SMS - hook all overloads (sendTextMessage, sendMultipartTextMessage, sendDataMessage)
+    // SMS: hooks for sendTextMessage, sendMultipartTextMessage, sendDataMessage
     hookAllOverloads('android.telephony.SmsManager', 'sendTextMessage', (args: any[]) => {
         const dest = '' + args[0];
         const text = '' + args[2];
@@ -560,7 +959,6 @@ Java.perform(() => {
         send({type: 'api', action: 'sms_send_data', dest: dest, timestamp: Date.now()});
     });
 
-    // Location - hook all overloads
     hookAllOverloads('android.location.LocationManager', 'getLastKnownLocation', (args: any[]) => {
         const provider = '' + args[0];
         console.log('[Location] getLastKnownLocation(' + provider + ')');
@@ -572,7 +970,7 @@ Java.perform(() => {
         send({type: 'api', action: 'location_updates', timestamp: Date.now()});
     });
 
-    // Package enumeration
+    // pkg enumeration
     hookAllOverloads('android.app.ApplicationPackageManager', 'getInstalledPackages', (args: any[]) => {
         console.log('[API] getInstalledPackages()');
         send({type: 'api', action: 'package_list', timestamp: Date.now()});
@@ -583,7 +981,6 @@ Java.perform(() => {
         send({type: 'api', action: 'app_list', timestamp: Date.now()});
     });
 
-    // TelephonyManager - device info exfiltration
     hookAllOverloads('android.telephony.TelephonyManager', 'getDeviceId', (args: any[]) => {
         console.log('[SYSTEM] getDeviceId()');
         send({type: 'system', action: 'get_device_id', timestamp: Date.now()});
@@ -609,13 +1006,13 @@ Java.perform(() => {
         send({type: 'system', action: 'get_sim_serial', timestamp: Date.now()});
     });
 
-    // WiFi info
+    // wifi info
     hookAllOverloads('android.net.wifi.WifiInfo', 'getMacAddress', (args: any[]) => {
         console.log('[SYSTEM] WifiInfo.getMacAddress()');
         send({type: 'system', action: 'get_mac_address', timestamp: Date.now()});
     });
 
-    // Contacts - data theft
+    // contacts: data theft
     hookAllOverloads('android.provider.ContactsContract$Contacts', 'getLookupUri', (args: any[]) => {
         console.log('[API] ContactsContract access');
         send({type: 'api', action: 'contacts_access', timestamp: Date.now()});
@@ -630,7 +1027,6 @@ Java.perform(() => {
     try {
         const classes = Java.enumerateLoadedClassesSync();
         for (let i = 0; i < classes.length; i++) {
-            // Retrofit2 OkHttp integration
             if (classes[i] === 'retrofit2.OkHttpCall' || classes[i].indexOf('retrofit2.OkHttpCall') !== -1) {
                 const OkHttpCall = Java.use('retrofit2.OkHttpCall');
                 hookAllOverloads('retrofit2.OkHttpCall', 'execute', (args: any[]) => {
@@ -662,21 +1058,26 @@ Java.perform(() => {
     hookAllOverloads('dalvik.system.DexClassLoader', '$init', (args: any[]) => {
         const dexPath = '' + args[0];
         console.log('[DEX] DexClassLoader loading: ' + dexPath);
-        send({type: 'api', action: 'dex_load', path: dexPath, timestamp: Date.now()});
+        let javaStack = '';
+        try { javaStack = Java.use('android.util.Log').getStackTraceString(Java.use('java.lang.Throwable').$new()); } catch(e) {}
+        send({type: 'api', action: 'dex_load', path: dexPath, java_backtrace: javaStack, timestamp: Date.now()});
     });
 
     hookAllOverloads('dalvik.system.PathClassLoader', '$init', (args: any[]) => {
         const dexPath = '' + args[0];
         console.log('[DEX] PathClassLoader loading: ' + dexPath);
-        send({type: 'api', action: 'path_classloader', path: dexPath, timestamp: Date.now()});
+        let javaStack = '';
+        try { javaStack = Java.use('android.util.Log').getStackTraceString(Java.use('java.lang.Throwable').$new()); } catch(e) {}
+        send({type: 'api', action: 'path_classloader', path: dexPath, java_backtrace: javaStack, timestamp: Date.now()});
     });
 
     try {
-        // API 26+ (InMemoryDexClassLoader), malware loads dex from byte array
         const InMemoryDex = Java.use('dalvik.system.InMemoryDexClassLoader');
         hookAllOverloads('dalvik.system.InMemoryDexClassLoader', '$init', (args: any[]) => {
             console.log('[DEX] InMemoryDexClassLoader - dex loaded from memory!');
-            send({type: 'api', action: 'inmemory_dex_load', timestamp: Date.now()});
+            let javaStack = '';
+            try { javaStack = Java.use('android.util.Log').getStackTraceString(Java.use('java.lang.Throwable').$new()); } catch(e) {}
+            send({type: 'api', action: 'inmemory_dex_load', java_backtrace: javaStack, timestamp: Date.now()});
         });
     } catch (e) {}
 
@@ -701,21 +1102,61 @@ Java.perform(() => {
         send({type: 'exec', action: 'process_builder', timestamp: Date.now()});
     });
 
-    // obfuscated malware uses reflection to call APIs.
-    // this is critical: if an app uses Class.forName + Method.invoke,
-    // the direct hooks on the target class won't fire. catch it here.
-    hookAllOverloads('java.lang.reflect.Method', 'invoke', (args: any[]) => {
+    // ClassLoader-based discrimination: classes from the boot classloader
+    // are genuinely system classes; classes from app classloaders are app
+    // code regardless of package name.
+    function _isSystemClass(className: string): boolean {
         try {
-            const methodObj = args[0];
-        } catch (e) {}
+            const cls = Java.use(className);
+            const loader = cls.class.getClassLoader();
+            // Boot classloader returns null in Java
+            if (loader === null) return true;
+            const loaderName = '' + loader.getClass().getName();
+            // System classloaders
+            if (loaderName === 'java.lang.BootClassLoader') return true;
+            // App classloaders — these are NOT system classes even if named android.*
+            if (loaderName.indexOf('PathClassLoader') !== -1 ||
+                loaderName.indexOf('DexClassLoader') !== -1 ||
+                loaderName.indexOf('InMemoryDexClassLoader') !== -1) {
+                // But check if it's loading from the system image, not the app APK
+                const loaderStr = '' + loader.toString();
+                if (loaderStr.indexOf('/system/') !== -1 ||
+                    loaderStr.indexOf('/apex/') !== -1) return true;
+                return false;
+            }
+            return true;  // unknown loaders treated as system to reduce noise
+        } catch (e) {
+            // Fallback: if we can't determine, use a minimal prefix check
+            // only for truly core framework packages
+            if (className.indexOf('java.lang.') === 0 ||
+                className.indexOf('java.util.') === 0 ||
+                className.indexOf('sun.') === 0 ||
+                className.indexOf('dalvik.system.') === 0) return true;
+            return false;
+        }
+    }
+
+    safeJavaHook('java.lang.reflect.Method', 'invoke', (cls: any) => {
+        const origInvoke = cls.invoke;
+        origInvoke.overloads.forEach((overload: any) => {
+            overload.implementation = function() {
+                try {
+                    const declaringClass = '' + this.getDeclaringClass().getName();
+                    if (!_isSystemClass(declaringClass)) {
+                        const mName = '' + this.getName();
+                        send({type: 'api', action: 'reflect_invoke', className: declaringClass, method: mName, timestamp: Date.now()});
+                    }
+                } catch (e) {}
+                return overload.apply(this, arguments);
+            };
+        });
     });
 
     hookAllOverloads('java.lang.Class', 'forName', (args: any[]) => {
         try {
             const className = '' + args[0];
-            // filter out noise from common framework classes
-            if (className.indexOf('android.') !== 0 && className.indexOf('java.') !== 0 &&
-                className.indexOf('androidx.') !== 0 && className.indexOf('com.google.') !== 0) {
+            // filter out noise from known-safe framework classes only
+            if (!_isSystemClass(className)) {
                 console.log('[REFLECT] Class.forName: ' + className);
                 send({type: 'api', action: 'class_forname', className: className, timestamp: Date.now()});
             }
@@ -757,24 +1198,8 @@ Java.perform(() => {
 
 console.log('[*] Installing dlopen watcher.');
 function installSSLHooksForModule(moduleName: string) {
-    if (_hookedNative['ssl_' + moduleName]) return;
-    try {
-        const mod = Process.findModuleByName(moduleName);
-        if (!mod) return;
-        const sslFuncs = ['SSL_read', 'SSL_write', 'SSL_connect'];
-        for (const funcName of sslFuncs) {
-            const funcPtr = mod.findExportByName(funcName);
-            if (funcPtr) {
-                Interceptor.attach(funcPtr, {
-                    onEnter: function(args: any) {
-                        bufferedSend({type: 'ssl', func: funcName, module: moduleName, timestamp: Date.now()});
-                    }
-                });
-            }
-        }
-        _hookedNative['ssl_' + moduleName] = true;
-        console.log('[+] Late SSL hooks for ' + moduleName);
-    } catch (e) {}
+    // ensures late-loaded SSL libraries also get full payload capture--not just event-level logging.
+    installSSLPayloadHooks(moduleName);
 }
 
 function scanStaticJniExports(libPath: string) {
@@ -806,6 +1231,7 @@ const _dlopenCallbacks = {
             const path = args[0].readUtf8String();
             if (path) {
                 this._dlopenPath = path;
+                this._dlopenBt = captureBacktrace(this.context);
             }
         } catch (e) {}
     },
@@ -814,10 +1240,11 @@ const _dlopenCallbacks = {
         const path = this._dlopenPath;
         const libName = path.split('/').pop();
 
-        bufferedSend({type: 'native', action: 'dlopen', path: path, library: libName, timestamp: Date.now()});
+        bufferedSend({type: 'native', action: 'dlopen', path: path, library: libName, backtrace: this._dlopenBt || [], timestamp: Date.now()});
         setTimeout(() => { scanStaticJniExports(path); }, 50);
 
-        if (libName && (libName.indexOf('ssl') !== -1 || libName.indexOf('crypto') !== -1)) {
+        if (libName && (libName.indexOf('ssl') !== -1 || libName.indexOf('crypto') !== -1 ||
+            libName.indexOf('boring') !== -1 || libName.indexOf('conscrypt') !== -1)) {
             console.log('[DLOPEN] SSL-related library loaded: ' + path);
             setTimeout(() => { installSSLHooksForModule(libName as string); }, 100);
         }
@@ -879,20 +1306,28 @@ function tryDeferredHooks() {
         Java.enumerateClassLoaders({
             onMatch: function(loader: any) {
                 try {
-                    (Java.classFactory as any).loader = loader;
+                    let factory: any;
+                    if (typeof (Java as any).ClassFactory !== 'undefined' &&
+                        typeof (Java as any).ClassFactory.get === 'function') {
+                        factory = (Java as any).ClassFactory.get(loader);
+                    } else {
+                        (Java.classFactory as any).loader = loader;
+                        factory = Java.classFactory;
+                    }
+
                     for (const className in DEFERRED_TARGETS) {
                         const target = DEFERRED_TARGETS[className];
                         if (target.hooked) continue;
                         try {
-                            const cls = Java.use(className);
+                            const cls = factory.use(className);
                             for (const methodName of target.methods) {
                                 hookAllOverloads(className, methodName, target.callback);
                             }
                             target.hooked = true;
-                            console.log('[DEFERRED] Late-hooked ' + className);
+                            console.log('[DEFERRED] Late-hooked ' + className + ' via classloader');
                             send({type: 'hook', action: 'deferred_success', className: className, timestamp: Date.now()});
                         } catch (e) {
-                            // ok
+                            // class not in this loader, try next.
                         }
                     }
                 } catch (e) {}
@@ -901,7 +1336,10 @@ function tryDeferredHooks() {
         });
 
         try {
-            (Java.classFactory as any).loader = null;
+            if (typeof (Java as any).ClassFactory === 'undefined' ||
+                typeof (Java as any).ClassFactory.get !== 'function') {
+                (Java.classFactory as any).loader = null;
+            }
         } catch(e) {}
     });
 }

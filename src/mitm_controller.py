@@ -36,8 +36,6 @@ class MITMController:
         """Return True if mitmdump is on PATH."""
         return shutil.which("mitmdump") is not None
 
-    # ── ADB helper ──────────────────────────────────────────────────────────
-
     def _adb(self, *args, timeout: int = 15) -> subprocess.CompletedProcess:
         if self.adb_serial:
             cmd = ["adb", "-s", self.adb_serial, *args]
@@ -48,16 +46,9 @@ class MITMController:
         except Exception:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
 
-    # ── Lifecycle ───────────────────────────────────────────────────────────
-
     def start(self) -> bool:
-        """Start mitmdump, configure device proxy, install CA cert.
-
-        Returns True if successfully started, False if mitmdump unavailable.
-        """
         if not self.is_available():
             return False
-
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         addon_path = Path(__file__).parent / "mitm_addon.py"
@@ -73,24 +64,18 @@ class MITMController:
             stderr=subprocess.DEVNULL,
         )
 
-        # Wait up to 3s for mitmdump to be ready
         for _ in range(30):
             if self._proc.poll() is not None:
-                break  # died
+                break
             time.sleep(0.1)
 
-        # Configure device proxy
         self._adb("shell", "settings", "put", "global", "http_proxy",
                   f"127.0.0.1:{self.port}")
-
-        # Install CA cert (best-effort)
         self._install_ca_cert()
 
-        return self._proc.poll() is None  # True if still running
+        return self._proc.poll() is None
 
     def stop(self) -> None:
-        """Terminate mitmdump and remove device proxy settings."""
-        # Kill mitmdump
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             try:
@@ -98,22 +83,17 @@ class MITMController:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
         self._proc = None
-
-        # Remove device proxy
         self._adb("shell", "settings", "delete", "global", "http_proxy")
 
     def _install_ca_cert(self) -> None:
-        """Push and install the mitmproxy CA cert on the device (best-effort)."""
         cert_path = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.cer"
         if not cert_path.exists():
-            return  # mitmdump hasn't run yet; cert generated on first flow
-
-        # Push cert to device
+            return
         result = self._adb("push", str(cert_path), "/sdcard/mitmproxy-ca.cer")
         if result.returncode != 0:
             return
 
-        # Try system cert install (rooted emulator, API 29+)
+        # system cert install
         try:
             hash_result = subprocess.run(
                 ["openssl", "x509", "-subject_hash_old", "-noout", "-in", str(cert_path)],
@@ -128,13 +108,10 @@ class MITMController:
         except Exception:
             pass
 
-        # Fallback: user cert install via Settings intent
         self._adb("shell", "am", "start",
                   "-a", "android.credentials.INSTALL",
                   "--ei", "android.credentials.INSTALL.type", "1",
                   "-d", "file:///sdcard/mitmproxy-ca.cer")
-
-    # ── Merge ───────────────────────────────────────────────────────────────
 
     def merge_into_network_sequence(
         self,
@@ -145,6 +122,7 @@ class MITMController:
 
         Each flow becomes a {"type": "mitm", ...} event sorted by relative_time.
         """
+
         if not self.flows_file.exists():
             return
 
@@ -156,7 +134,6 @@ class MITMController:
             net_seq = json.load(f)
 
         sequence = net_seq.get("sequence", [])
-
         with open(self.flows_file) as f:
             for line in f:
                 line = line.strip()
