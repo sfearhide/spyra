@@ -221,65 +221,86 @@ Java.perform(() => {
     });
 
     safeJavaHook('com.android.okhttp.internal.huc.HttpURLConnectionImpl', 'getInputStream', (cls: any) => {
-        cls.getInputStream.implementation = function() {
-            try {
-                const url = this.getURL().toString();
-                const method = this.getRequestMethod();
-                console.log('[HTTP] ' + method + ' ' + url);
-                _send({type: 'network', action: 'http_request', method: method, url: url, timestamp: Date.now()});
-            } catch (e) {}
-            return this.getInputStream();
-        };
+        const overloads = cls.getInputStream.overloads;
+        for (let i = 0; i < overloads.length; i++) {
+            const overload = overloads[i];
+            overload.implementation = function() {
+                try {
+                    const url = this.getURL().toString();
+                    const method = this.getRequestMethod();
+                    console.log('[HTTP] ' + method + ' ' + url);
+                    _send({type: 'network', action: 'http_request', method: method, url: url, timestamp: Date.now()});
+                } catch (e) {}
+                return overload.call(this);
+            };
+        }
     });
 
     safeJavaHook('com.android.okhttp.internal.huc.HttpURLConnectionImpl', 'getOutputStream', (cls: any) => {
-        cls.getOutputStream.implementation = function() {
-            try {
-                const url = this.getURL().toString();
-                const method = this.getRequestMethod();
-                console.log('[HTTP] ' + method + ' ' + url + ' (body)');
-                _send({type: 'network', action: 'http_request_body', method: method, url: url, timestamp: Date.now()});
-            } catch (e) {}
-            return this.getOutputStream();
-        };
+        const overloads = cls.getOutputStream.overloads;
+        for (let i = 0; i < overloads.length; i++) {
+            const overload = overloads[i];
+            overload.implementation = function() {
+                try {
+                    const url = this.getURL().toString();
+                    const method = this.getRequestMethod();
+                    console.log('[HTTP] ' + method + ' ' + url + ' (body)');
+                    _send({type: 'network', action: 'http_request_body', method: method, url: url, timestamp: Date.now()});
+                } catch (e) {}
+                return overload.call(this);
+            };
+        }
     });
 
     // HttpsURLConnection
     safeJavaHook('javax.net.ssl.HttpsURLConnection', 'getInputStream', (cls: any) => {
-        cls.getInputStream.implementation = function() {
-            try {
-                const url = this.getURL().toString();
-                const method = this.getRequestMethod();
-                console.log('[HTTPS] ' + method + ' ' + url);
-                _send({type: 'network', action: 'https_request', method: method, url: url, timestamp: Date.now()});
-            } catch (e) {}
-            return this.getInputStream();
-        };
+        const overloads = cls.getInputStream.overloads;
+        for (let i = 0; i < overloads.length; i++) {
+            const overload = overloads[i];
+            overload.implementation = function() {
+                try {
+                    const url = this.getURL().toString();
+                    const method = this.getRequestMethod();
+                    console.log('[HTTPS] ' + method + ' ' + url);
+                    _send({type: 'network', action: 'https_request', method: method, url: url, timestamp: Date.now()});
+                } catch (e) {}
+                return overload.call(this);
+            };
+        }
     });
 
     // OkHttp3
     safeJavaHook('okhttp3.OkHttpClient', 'newCall', (cls: any) => {
-        cls.newCall.implementation = function(request: any) {
-            try {
-                const url = request.url().toString();
-                const method = request.method();
-                console.log('[OKHTTP] ' + method + ' ' + url);
-                _send({type: 'network', action: 'okhttp_request', method: method, url: url, timestamp: Date.now()});
-            } catch (e) {}
-            return this.newCall(request);
-        };
+        const overloads = cls.newCall.overloads;
+        for (let i = 0; i < overloads.length; i++) {
+            const overload = overloads[i];
+            overload.implementation = function() {
+                try {
+                    const request = arguments[0];
+                    const url = request.url().toString();
+                    const method = request.method();
+                    console.log('[OKHTTP] ' + method + ' ' + url);
+                    _send({type: 'network', action: 'okhttp_request', method: method, url: url, timestamp: Date.now()});
+                } catch (e) {}
+                return overload.apply(this, arguments);
+            };
+        }
     });
 
     // OkHttp3 response body
     safeJavaHook('okhttp3.ResponseBody', 'string', (cls: any) => {
-        cls.string.implementation = function() {
-            const body = this.string();
-            try {
-                const preview = body.length > 500 ? body.substring(0, 500) + '...' : body;
-                _send({type: 'network', action: 'okhttp_response', body: preview, size: body.length, timestamp: Date.now()});
-            } catch (e) {}
-            return body;
-        };
+        const overloads = cls.string.overloads;
+        for (let i = 0; i < overloads.length; i++) {
+            const overload = overloads[i];
+            overload.implementation = function() {
+                const body = overload.call(this);
+                try {
+                    const preview = body.length > 500 ? body.substring(0, 500) + '...' : body;
+                    _send({type: 'network', action: 'okhttp_response', body: preview, size: body.length, timestamp: Date.now()});
+                } catch (e) {}
+                return body;
+            };
+        }
     });
 
     hookAllOverloads('java.net.Socket', '$init', (args: any[]) => {
@@ -813,28 +834,29 @@ setTimeout(() => {
                 const mainLooper = Looper.getMainLooper();
                 const mainThread = mainLooper.getThread();
                 const appMainTid = mainThread.getId();
-                console.log('[*] App main thread ID: ' + appMainTid);
+                console.log('[*] App main thread ID (avoiding for Stalker): ' + appMainTid);
+
                 const threads = Process.enumerateThreads();
-                let targetTid = threads[0].id;
+                let targetTid: number | null = null;
                 for (const t of threads) {
-                    if (t.id === appMainTid) {
+                    if (t.id !== appMainTid && t.name && t.name.indexOf('gmain') === -1) {
                         targetTid = t.id;
                         break;
                     }
                 }
-                startStalker(threads[0].id);
-            } catch (e) {
-                console.log('[-] Could not determine app main thread: ' + e);
-                const threads = Process.enumerateThreads();
-                if (threads.length > 0) {
-                    startStalker(threads[0].id);
+                if (targetTid !== null) {
+                    startStalker(targetTid);
+                } else {
+                    console.log('[*] No suitable worker thread for Stalker — skipping');
                 }
+            } catch (e) {
+                console.log('[-] Could not determine app main thread for Stalker: ' + e);
             }
         });
     } catch (e) {
         console.log('[-] Could not start Stalker: ' + e);
     }
-}, 3000);
+}, 5000);
 
 if (libc) {
     const pthreadCreatePtr = libc.findExportByName('pthread_create');
@@ -1076,44 +1098,37 @@ Java.perform(() => {
         _send({type: 'exec', action: 'process_builder', timestamp: Date.now()});
     });
 
-    function _isSystemClass(className: string): boolean {
-        try {
-            const cls = Java.use(className);
-            const loader = cls.class.getClassLoader();
-            if (loader === null) return true;
-            
-            const loaderName = '' + loader.getClass().getName();
-            if (loaderName === 'java.lang.BootClassLoader') return true;
-            if (loaderName.indexOf('PathClassLoader') !== -1 ||
-                loaderName.indexOf('DexClassLoader') !== -1 ||
-                loaderName.indexOf('InMemoryDexClassLoader') !== -1) {
+    const _systemPrefixes = [
+        'java.', 'javax.', 'sun.', 'com.sun.', 'dalvik.', 'libcore.',
+        'android.', 'androidx.', 'com.android.', 'com.google.android.',
+        'kotlin.', 'kotlinx.', 'org.json.', 'org.xml.', 'org.w3c.',
+        'org.apache.harmony.', 'org.apache.http.',
+    ];
 
-                const loaderStr = '' + loader.toString();
-                if (loaderStr.indexOf('/system/') !== -1 ||
-                    loaderStr.indexOf('/apex/') !== -1) return true;
-                return false;
-            }
-            return true;  // unknown loaders treated as system to reduce noise
-        } catch (e) {
-            if (className.indexOf('java.lang.') === 0 ||
-                className.indexOf('java.util.') === 0 ||
-                className.indexOf('sun.') === 0 ||
-                className.indexOf('dalvik.system.') === 0) return true;
-            return false;
+    function _isSystemClass(className: string): boolean {
+        for (let i = 0; i < _systemPrefixes.length; i++) {
+            if (className.indexOf(_systemPrefixes[i]) === 0) return true;
         }
+        return false;
     }
+
+    let _invokeGuard = false;
 
     safeJavaHook('java.lang.reflect.Method', 'invoke', (cls: any) => {
         const origInvoke = cls.invoke;
         origInvoke.overloads.forEach((overload: any) => {
             overload.implementation = function() {
-                try {
-                    const declaringClass = '' + this.getDeclaringClass().getName();
-                    if (!_isSystemClass(declaringClass)) {
-                        const mName = '' + this.getName();
-                        _send({type: 'api', action: 'reflect_invoke', className: declaringClass, method: mName, timestamp: Date.now()});
-                    }
-                } catch (e) {}
+                if (!_invokeGuard) {
+                    _invokeGuard = true;
+                    try {
+                        const declaringClass = '' + this.getDeclaringClass().getName();
+                        if (!_isSystemClass(declaringClass)) {
+                            const mName = '' + this.getName();
+                            _send({type: 'api', action: 'reflect_invoke', className: declaringClass, method: mName, timestamp: Date.now()});
+                        }
+                    } catch (e) {}
+                    _invokeGuard = false;
+                }
                 return overload.apply(this, arguments);
             };
         });
@@ -1122,7 +1137,6 @@ Java.perform(() => {
     hookAllOverloads('java.lang.Class', 'forName', (args: any[]) => {
         try {
             const className = '' + args[0];
-            // filter out noise from known-safe framework classes only
             if (!_isSystemClass(className)) {
                 console.log('[REFLECT] Class.forName: ' + className);
                 _send({type: 'api', action: 'class_forname', className: className, timestamp: Date.now()});
