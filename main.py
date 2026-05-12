@@ -363,7 +363,7 @@ def launch_app(device, package_name, apk_path=None, max_retries=3):
     )
 
 
-def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None, label=None, label_source=None):
+def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None, label=None, label_source=None, exerciser=None, duration=120):
     api_sequence = []
     network_sequence = []
     start_time = None
@@ -579,15 +579,22 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
 
         console.print(f"[green]Frida script loaded ({mode} mode, PID {pid})[/green]")
         console.print(
-            "[yellow]Monitoring app activity.. (Press Ctrl+C to stop)[/yellow]\n"
+            f"[yellow]Monitoring app activity for {duration}s.. (Press Ctrl+C to stop early)[/yellow]\n"
         )
 
+        if exerciser is not None:
+            exerciser.start()
+
         try:
-            while True:
+            deadline = time.time() + duration
+            while time.time() < deadline:
                 time.sleep(0.1)
+            console.print(f"\n[yellow]Duration ({duration}s) reached. Stopping capture...[/yellow]")
         except KeyboardInterrupt:
             console.print("\n[yellow]Stopping capture...[/yellow]")
         finally:
+            if exerciser is not None:
+                exerciser.stop()
             _save()
             try:
                 session.detach()
@@ -749,22 +756,24 @@ def main():
 
     console.print("\n[bold][+] Running Frida script[/bold]")
     session_start_time = time.time()
-    run_frida_script(
-        device, package_name, js_file,
-        apk_path=apk_path, apk_hash=apk_hash,
-        label=args.label, label_source=args.label_source,
-        exerciser=exerciser,
-        duration=args.duration,
-    )
+    try:
+        run_frida_script(
+            device, package_name, js_file,
+            apk_path=apk_path, apk_hash=apk_hash,
+            label=args.label, label_source=args.label_source,
+            exerciser=exerciser,
+            duration=args.duration,
+        )
+    finally:
+        # always stop mitm — even on crash/SIGTERM — so the port is freed
+        if mitm:
+            console.print("\n[bold][+] Stopping MITM proxy[/bold]")
+            mitm.stop()
 
-    if mitm:
-        console.print("\n[bold][+] Stopping MITM proxy[/bold]")
-        mitm.stop()
-        
-        net_file = Path("output") / package_name / f"{package_name}_network_sequence.json"
-        if net_file.exists():
-            mitm.merge_into_network_sequence(str(net_file), session_start_time)
-            console.print(f"[green]✓ MITM flows merged into {net_file.name}[/green]")
+            net_file = Path("output") / package_name / f"{package_name}_network_sequence.json"
+            if net_file.exists():
+                mitm.merge_into_network_sequence(str(net_file), session_start_time)
+                console.print(f"[green]✓ MITM flows merged into {net_file.name}[/green]")
 
 
 if __name__ == "__main__":

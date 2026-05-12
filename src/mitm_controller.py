@@ -7,6 +7,7 @@ CA cert installation, and merges captured flows into network_sequence.json.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -46,10 +47,39 @@ class MITMController:
         except Exception:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
 
+    def _kill_stale_mitmdump(self) -> None:
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f"tcp:{self.port}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for pid_str in result.stdout.strip().split("\n"):
+                    pid_str = pid_str.strip()
+                    if pid_str.isdigit():
+                        import signal
+                        try:
+                            os.kill(int(pid_str), signal.SIGTERM)
+                        except OSError:
+                            pass
+                time.sleep(0.5)
+        except FileNotFoundError:
+            try:
+                subprocess.run(
+                    ["fuser", "-k", f"{self.port}/tcp"],
+                    capture_output=True, timeout=5,
+                )
+                time.sleep(0.5)
+            except (FileNotFoundError, Exception):
+                pass
+        except Exception:
+            pass
+
     def start(self) -> bool:
         if not self.is_available():
             return False
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._kill_stale_mitmdump()
 
         addon_path = Path(__file__).parent / "mitm_addon.py"
         self._proc = subprocess.Popen(

@@ -128,13 +128,45 @@ class FrameworkDetector:
                 )
                 self.detected_frameworks.append(sig)
 
-        if self._has_native_code():
+        has_native_libs = self._has_native_code()
+
+        if has_native_libs:
             self.detected_frameworks.append(
                 FrameworkSignature(
-                    name="native",
-                    framework_type=FrameworkType.NATIVE_JAVA,
+                    name="native_cpp",
+                    framework_type=FrameworkType.NATIVE_CPP,
                     indicators={},
                     confidence=1.0,
+                )
+            )
+
+        has_cross_platform = any(
+            f.framework_type not in (
+                FrameworkType.NATIVE_JAVA,
+                FrameworkType.NATIVE_KOTLIN,
+                FrameworkType.NATIVE_CPP,
+            )
+            for f in self.detected_frameworks
+        )
+
+        is_kotlin = self._detect_kotlin()
+
+        if is_kotlin:
+            self.detected_frameworks.append(
+                FrameworkSignature(
+                    name="native_kotlin",
+                    framework_type=FrameworkType.NATIVE_KOTLIN,
+                    indicators={},
+                    confidence=0.9 if not has_cross_platform else 0.5,
+                )
+            )
+        else:
+            self.detected_frameworks.append(
+                FrameworkSignature(
+                    name="native_java",
+                    framework_type=FrameworkType.NATIVE_JAVA,
+                    indicators={},
+                    confidence=0.9 if not has_cross_platform else 0.5,
                 )
             )
 
@@ -227,6 +259,28 @@ class FrameworkDetector:
                 return True
         return False
 
+    def _detect_kotlin(self) -> bool:
+        """Detect whether the app uses Kotlin (vs plain Java).
+
+        Kotlin apps include kotlin.Metadata annotations, kotlin/ stdlib
+        classes, or META-INF/**.kotlin_module files.
+        """
+        for smali_dir in self.decompiled_dir.glob("smali*"):
+            kotlin_dir = smali_dir / "kotlin"
+            if kotlin_dir.exists():
+                return true
+
+            metadata_file = smali_dir / "kotlin" / "Metadata.smali"
+            if metadata_file.exists():
+                return True
+
+        meta_inf = self.decompiled_dir / "original" / "META-INF"
+        if meta_inf.exists():
+            if list(meta_inf.rglob("*.kotlin_module")):
+                return True
+
+        return False
+
 
 class HookGenerator:
     def __init__(self, frameworks: List[FrameworkSignature]):
@@ -266,6 +320,7 @@ console.log('[*] Detected frameworks: """
         script += self._generate_anti_detection_bypass()
 
         # framework-specific hooks
+        _baseline_hooks_added = False
         for framework in self.frameworks:
             if framework.framework_type == FrameworkType.REACT_NATIVE:
                 script += self._generate_react_native_hooks()
@@ -279,16 +334,19 @@ console.log('[*] Detected frameworks: """
                 script += self._generate_cordova_hooks()
             elif framework.framework_type == FrameworkType.WEBVIEW_HYBRID:
                 script += self._generate_webview_hooks()
-            elif framework.framework_type == FrameworkType.NATIVE_JAVA:
-                script += self._generate_java_network_hooks()
-                script += self._generate_native_hooks()
-                script += self._generate_crypto_hooks()
-                script += self._generate_android_api_hooks()
+            elif framework.framework_type in (
+                FrameworkType.NATIVE_JAVA,
+                FrameworkType.NATIVE_KOTLIN,
+                FrameworkType.NATIVE_CPP,
+            ):
+                if not _baseline_hooks_added:
+                    script += self._generate_java_network_hooks()
+                    script += self._generate_native_hooks()
+                    script += self._generate_crypto_hooks()
+                    script += self._generate_android_api_hooks()
+                    _baseline_hooks_added = True
 
-        # add native hooks only if not already added
-        if not any(
-            f.framework_type == FrameworkType.NATIVE_JAVA for f in self.frameworks
-        ):
+        if not _baseline_hooks_added:
             script += self._generate_java_network_hooks()
             script += self._generate_native_hooks()
             script += self._generate_crypto_hooks()
@@ -302,6 +360,7 @@ console.log('[*] Detected frameworks: """
 
         # deferred class hooking via classloader enumeration
         script += self._generate_deferred_hooks()
+        script = re.sub(r'(?<![a-zA-Z_])send\(', '_send(', script)
 
         return script, is_typescript
 
@@ -314,13 +373,16 @@ Process.setExceptionHandler(function(details: any) {
     return true; // suppress the exception, keep the process alive
 });
 
-const _origFridaSend = send;
-(globalThis as any).send = function(payload: any, data?: any) {
+// send() is read-only in Frida 17+ ESM runtime — cannot be reassigned on
+// globalThis.  Instead, define a wrapper that injects thread_id and call it
+// throughout the hooks.
+const _fridaSend = send;
+function _send(payload: any, data?: any) {
     if (typeof payload === 'object' && payload !== null) {
         payload.thread_id = Process.getCurrentThreadId();
     }
-    _origFridaSend(payload, data !== undefined ? data : null);
-};
+    _fridaSend(payload, data !== undefined ? data : null);
+}
 
 // catches errors per-hook so one failing hook does not prevent others from installing
 function safeJavaHook(className: string, methodName: string, hookFn: (cls: any) => void) {
@@ -391,15 +453,6 @@ function captureBacktrace(ctx: any): string[] {
 
 const _hookedNative: any = {};  // track which native funcs we already hooked
 const _hookedClasses: any = {}; // track which Java classes we already hooked
-
-// thread-aware send wrapper — injects thread_id into every event
-// so the LSTM can model per-thread behavioral sequences
-function tsend(payload: any, data?: ArrayBuffer | null) {
-    if (typeof payload === 'object' && payload !== null) {
-        payload.thread_id = Process.getCurrentThreadId();
-    }
-    send(payload, data);
-}
 """
 
     def _generate_anti_detection_bypass(self) -> str:
