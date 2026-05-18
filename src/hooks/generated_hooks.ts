@@ -10,8 +10,14 @@ declare const Memory: any;
 declare const send: any;
 declare const console: any;
 declare const setTimeout: any;
+declare const setInterval: any;
 declare const ptr: any;
 declare const NULL: any;
+declare const Stalker: any;
+declare const DebugSymbol: any;
+declare const Backtracer: any;
+declare const Thread: any;
+declare const rpc: any;
 
 console.log('[*] Detected frameworks: native_java');
 
@@ -110,6 +116,7 @@ const _hookedClasses: any = {}; // track which Java classes we already hooked
 console.log('[*] Installing anti-detection bypass.');
 
 Java.perform(() => {
+    setTimeout(() => {
     const rootIndicators = [
         '/system/app/Superuser.apk', '/sbin/su', '/system/bin/su',
         '/system/xbin/su', '/data/local/xbin/su', '/data/local/bin/su',
@@ -202,16 +209,18 @@ Java.perform(() => {
     try {
         const NetworkSecurityConfig = Java.use('android.security.net.config.NetworkSecurityConfig');
         if (NetworkSecurityConfig.isCleartextTrafficPermitted) {
-            NetworkSecurityConfig.isCleartextTrafficPermitted.overloads.forEach((overload: any) => {
-                overload.implementation = function() {
+            const clearOverloads = NetworkSecurityConfig.isCleartextTrafficPermitted.overloads;
+            for (let i = 0; i < clearOverloads.length; i++) {
+                clearOverloads[i].implementation = function() {
                     return true;
                 };
-            });
-            console.log('[+] NetworkSecurityConfig cleartext bypass');
+            }
+            console.log('pass');
         }
     } catch (e) {}
 
     console.log('[+] Anti-detection bypass installed');
+    }, 1000);
 });
 
 console.log('[*] Installing Java network hooks.');
@@ -1116,22 +1125,25 @@ Java.perform(() => {
 
     safeJavaHook('java.lang.reflect.Method', 'invoke', (cls: any) => {
         const origInvoke = cls.invoke;
-        origInvoke.overloads.forEach((overload: any) => {
-            overload.implementation = function() {
-                if (!_invokeGuard) {
-                    _invokeGuard = true;
-                    try {
-                        const declaringClass = '' + this.getDeclaringClass().getName();
-                        if (!_isSystemClass(declaringClass)) {
-                            const mName = '' + this.getName();
-                            _send({type: 'api', action: 'reflect_invoke', className: declaringClass, method: mName, timestamp: Date.now()});
-                        }
-                    } catch (e) {}
-                    _invokeGuard = false;
-                }
-                return overload.apply(this, arguments);
-            };
-        });
+        const invokeOverloads = origInvoke.overloads;
+        for (let i = 0; i < invokeOverloads.length; i++) {
+            (function(overload: any) {
+                overload.implementation = function() {
+                    if (!_invokeGuard) {
+                        _invokeGuard = true;
+                        try {
+                            const declaringClass = '' + this.getDeclaringClass().getName();
+                            if (!_isSystemClass(declaringClass)) {
+                                const mName = '' + this.getName();
+                                _send({type: 'api', action: 'reflect_invoke', className: declaringClass, method: mName, timestamp: Date.now()});
+                            }
+                        } catch (e) {}
+                        _invokeGuard = false;
+                    }
+                    return overload.apply(this, arguments);
+                };
+            })(invokeOverloads[i]);
+        }
     });
 
     hookAllOverloads('java.lang.Class', 'forName', (args: any[]) => {
@@ -1200,51 +1212,55 @@ function scanStaticJniExports(libPath: string) {
     } catch (e) {}
 }
 
-const dlopenPtr = Module.findExportByName('libc.so', 'dlopen');
-const androidDlopenExtPtr = Module.findExportByName('libdl.so', 'android_dlopen_ext') ||
-                            Module.findExportByName('libc.so', 'android_dlopen_ext');
+try {
+    const dlopenPtr = Module.findExportByName('libc.so', 'dlopen');
+    const androidDlopenExtPtr = Module.findExportByName('libdl.so', 'android_dlopen_ext') ||
+                                Module.findExportByName('libc.so', 'android_dlopen_ext');
 
-const _dlopenCallbacks = {
-    onEnter: function(this: any, args: any) {
-        try {
-            const path = args[0].readUtf8String();
-            if (path) {
-                this._dlopenPath = path;
-                this._dlopenBt = captureBacktrace(this.context);
+    const _dlopenCallbacks = {
+        onEnter: function(this: any, args: any) {
+            try {
+                const path = args[0].readUtf8String();
+                if (path) {
+                    this._dlopenPath = path;
+                    this._dlopenBt = captureBacktrace(this.context);
+                }
+            } catch (e) {}
+        },
+        onLeave: function(this: any, retval: any) {
+            if (!this._dlopenPath) return;
+            const path = this._dlopenPath;
+            const libName = path.split('/').pop();
+
+            bufferedSend({type: 'native', action: 'dlopen', path: path, library: libName, backtrace: this._dlopenBt || [], timestamp: Date.now()});
+            setTimeout(() => { scanStaticJniExports(path); }, 50);
+
+            if (libName && (libName.indexOf('ssl') !== -1 || libName.indexOf('crypto') !== -1 ||
+                libName.indexOf('boring') !== -1 || libName.indexOf('conscrypt') !== -1)) {
+                console.log('[DLOPEN] SSL-related library loaded: ' + path);
+                setTimeout(() => { installSSLHooksForModule(libName as string); }, 100);
             }
-        } catch (e) {}
-    },
-    onLeave: function(this: any, retval: any) {
-        if (!this._dlopenPath) return;
-        const path = this._dlopenPath;
-        const libName = path.split('/').pop();
 
-        bufferedSend({type: 'native', action: 'dlopen', path: path, library: libName, backtrace: this._dlopenBt || [], timestamp: Date.now()});
-        setTimeout(() => { scanStaticJniExports(path); }, 50);
-
-        if (libName && (libName.indexOf('ssl') !== -1 || libName.indexOf('crypto') !== -1 ||
-            libName.indexOf('boring') !== -1 || libName.indexOf('conscrypt') !== -1)) {
-            console.log('[DLOPEN] SSL-related library loaded: ' + path);
-            setTimeout(() => { installSSLHooksForModule(libName as string); }, 100);
-        }
-
-        const suspicious = ['payload', 'shell', 'exploit', 'inject', 'hack', 'root', 'hide'];
-        for (const kw of suspicious) {
-            if (libName && libName.toLowerCase().indexOf(kw) !== -1) {
-                console.log('[!] SUSPICIOUS library loaded: ' + path);
-                bufferedSend({type: 'native', action: 'suspicious_lib', path: path, keyword: kw, timestamp: Date.now()});
+            const suspicious = ['payload', 'shell', 'exploit', 'inject', 'hack', 'root', 'hide'];
+            for (const kw of suspicious) {
+                if (libName && libName.toLowerCase().indexOf(kw) !== -1) {
+                    console.log('[!] SUSPICIOUS library loaded: ' + path);
+                    bufferedSend({type: 'native', action: 'suspicious_lib', path: path, keyword: kw, timestamp: Date.now()});
+                }
             }
         }
+    };
+
+    if (dlopenPtr) {
+        Interceptor.attach(dlopenPtr, _dlopenCallbacks);
+        console.log('[+] dlopen watcher');
     }
-};
-
-if (dlopenPtr) {
-    Interceptor.attach(dlopenPtr, _dlopenCallbacks);
-    console.log('[+] dlopen watcher');
-}
-if (androidDlopenExtPtr) {
-    Interceptor.attach(androidDlopenExtPtr, _dlopenCallbacks);
-    console.log('[+] android_dlopen_ext watcher');
+    if (androidDlopenExtPtr) {
+        Interceptor.attach(androidDlopenExtPtr, _dlopenCallbacks);
+        console.log('[+] android_dlopen_ext watcher');
+    }
+} catch (e) {
+    console.log('[-] dlopen watcher failed: ' + e);
 }
 
 console.log('[*] Installing deferred hook system.');
@@ -1281,46 +1297,67 @@ const DEFERRED_TARGETS: any = {
 };
 
 function tryDeferredHooks() {
-    Java.perform(() => {
-        Java.enumerateClassLoaders({
-            onMatch: function(loader: any) {
-                try {
-                    let factory: any;
-                    if (typeof (Java as any).ClassFactory !== 'undefined' &&
-                        typeof (Java as any).ClassFactory.get === 'function') {
-                        factory = (Java as any).ClassFactory.get(loader);
-                    } else {
-                        (Java.classFactory as any).loader = loader;
-                        factory = Java.classFactory;
-                    }
-
-                    for (const className in DEFERRED_TARGETS) {
-                        const target = DEFERRED_TARGETS[className];
-                        if (target.hooked) continue;
-                        try {
-                            const cls = factory.use(className);
-                            for (const methodName of target.methods) {
-                                hookAllOverloads(className, methodName, target.callback);
-                            }
-                            target.hooked = true;
-                            console.log('[DEFERRED] Late-hooked ' + className + ' via classloader');
-                            _send({type: 'hook', action: 'deferred_success', className: className, timestamp: Date.now()});
-                        } catch (e) {
-                            // class not in this loader, try next.
+    try {
+        Java.perform(() => {
+            if (typeof Java.enumerateClassLoaders !== 'function') {
+                for (const className in DEFERRED_TARGETS) {
+                    const target = DEFERRED_TARGETS[className];
+                    if (target.hooked) continue;
+                    try {
+                        Java.use(className);
+                        for (const methodName of target.methods) {
+                            hookAllOverloads(className, methodName, target.callback);
                         }
-                    }
-                } catch (e) {}
-            },
-            onComplete: function() {}
-        });
-
-        try {
-            if (typeof (Java as any).ClassFactory === 'undefined' ||
-                typeof (Java as any).ClassFactory.get !== 'function') {
-                (Java.classFactory as any).loader = null;
+                        target.hooked = true;
+                        console.log('[DEFERRED] Late-hooked ' + className);
+                        _send({type: 'hook', action: 'deferred_success', className: className, timestamp: Date.now()});
+                    } catch (e) {}
+                }
+                return;
             }
-        } catch(e) {}
-    });
+
+            Java.enumerateClassLoaders({
+                onMatch: function(loader: any) {
+                    try {
+                        let factory: any;
+                        if (typeof (Java as any).ClassFactory !== 'undefined' &&
+                            typeof (Java as any).ClassFactory.get === 'function') {
+                            factory = (Java as any).ClassFactory.get(loader);
+                        } else {
+                            (Java.classFactory as any).loader = loader;
+                            factory = Java.classFactory;
+                        }
+
+                        for (const className in DEFERRED_TARGETS) {
+                            const target = DEFERRED_TARGETS[className];
+                            if (target.hooked) continue;
+                            try {
+                                const cls = factory.use(className);
+                                for (const methodName of target.methods) {
+                                    hookAllOverloads(className, methodName, target.callback);
+                                }
+                                target.hooked = true;
+                                console.log('[DEFERRED] Late-hooked ' + className + ' via classloader');
+                                _send({type: 'hook', action: 'deferred_success', className: className, timestamp: Date.now()});
+                            } catch (e) {
+                                // next
+                            }
+                        }
+                    } catch (e) {}
+                },
+                onComplete: function() {}
+            });
+
+            try {
+                if (typeof (Java as any).ClassFactory === 'undefined' ||
+                    typeof (Java as any).ClassFactory.get !== 'function') {
+                    (Java.classFactory as any).loader = null;
+                }
+            } catch(e) {}
+        });
+    } catch (e) {
+        console.log('[-] Deferred hooks failed: ' + e);
+    }
 }
 
 setTimeout(tryDeferredHooks, 3000);
@@ -1380,3 +1417,20 @@ Java.perform(() => {
 });
 
 console.log('[*] All hooks installed. Interact with the app to capture behavior.');
+
+// lets the py-host flush buffered events before detaching
+rpc.exports = {
+    flushBuffers: function() {
+        try { flushIpcBuffer(); } catch (e) {}
+        try { flushStalkerBuffer(); } catch (e) {}
+        return { ipc: _ipcBuffer.length, stalker: _stalkerCallBuffer.length };
+    },
+    dispose: function() {
+        try { flushIpcBuffer(); } catch (e) {}
+        try { flushStalkerBuffer(); } catch (e) {}
+        if (_stalkerActive) {
+            try { Stalker.flush(); } catch (e) {}
+            try { Stalker.unfollow(); } catch (e) {}
+        }
+    }
+};

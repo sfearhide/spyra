@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import os
 import sys
+import signal
 import subprocess
 import shutil
 import json
@@ -7,6 +9,7 @@ import frida
 import time
 import hashlib
 import argparse
+import threading
 from pathlib import Path
 from rich.panel import Panel
 from rich.table import Table
@@ -585,21 +588,56 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
         if exerciser is not None:
             exerciser.start()
 
+        _force_exit = threading.Event()
+
+        def _sigint_force(signum, frame):
+            console.print("\n[red]Forced exit (second Ctrl+C)[/red]")
+            _force_exit.set()
+            threading.Timer(2.0, lambda: os._exit(1)).start()
+
         try:
             deadline = time.time() + duration
             while time.time() < deadline:
                 time.sleep(0.1)
             console.print(f"\n[yellow]Duration ({duration}s) reached. Stopping capture...[/yellow]")
         except KeyboardInterrupt:
-            console.print("\n[yellow]Stopping capture...[/yellow]")
+            console.print("\n[yellow]Stopping capture... (press Ctrl+C again to force quit)[/yellow]")
+            # force-exit handler (Ctrl+C)
+            signal.signal(signal.SIGINT, _sigint_force)
         finally:
             if exerciser is not None:
                 exerciser.stop()
-            _save()
+
             try:
-                session.detach()
+                script.exports_sync.flush_buffers()
             except Exception:
                 pass
+
+            try:
+                grace_deadline = time.time() + 1.0
+                while time.time() < grace_deadline and not _force_exit.is_set():
+                    time.sleep(0.05)
+            except Exception:
+                pass
+
+            _save()
+
+            # detach with a timeout
+            def _detach():
+                try:
+                    script.exports_sync.dispose()
+                except Exception:
+                    pass
+                try:
+                    session.detach()
+                except Exception:
+                    pass
+
+            detach_thread = threading.Thread(target=_detach, daemon=True)
+            detach_thread.start()
+            detach_thread.join(timeout=5.0)
+            if detach_thread.is_alive():
+                console.print("[yellow]Detach timed out (5s) — forcing exit[/yellow]")
             console.print("[green]Session ended[/green]")
 
     except frida.ProcessNotFoundError:
