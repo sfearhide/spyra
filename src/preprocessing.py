@@ -236,6 +236,7 @@ def preprocess_directory(
                     "sha256": meta.get("apk_sha256", ""),
                     "label": meta.get("label", "unlabeled"),
                     "n_windows": windows.shape[0],
+                    "termination_attempts": meta.get("termination_attempts", 0),
                 })
                 print(f"  [+] {api_file.parent.name}: {windows.shape[0]} windows, label={meta.get('label', 'unlabeled')}")
         except Exception as e:

@@ -173,7 +173,7 @@ def compute_apk_hash(apk_path):
     return sha256.hexdigest()
 
 
-def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, label=None, label_source=None):
+def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, label=None, label_source=None, termination_attempts=0):
     output_dir = Path("output") / package_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -191,6 +191,7 @@ def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, la
         "capture_start": start_iso,
         "capture_end": end_iso,
         "duration_seconds": round(duration, 3),
+        "termination_attempts": termination_attempts,
     }
 
     api_data = {
@@ -372,17 +373,24 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
     start_time = None
     api_seq_num = 0
     net_seq_num = 0
+    _saved = False  # guard against double-save
+    _termination_attempts = 0  # count blocked System.exit / kill / finish calls
 
     def _save():
-        """Save captured sequences - called on any exit path."""
-        nonlocal start_time
+        nonlocal start_time, _saved
+        if _saved:
+            return
+        _saved = True
         if start_time is None and (api_sequence or network_sequence):
             start_time = time.time()
         if api_sequence or network_sequence:
             save_sequences(package_name, api_sequence, network_sequence, start_time,
-                           apk_hash=apk_hash, label=label, label_source=label_source)
+                           apk_hash=apk_hash, label=label, label_source=label_source,
+                           termination_attempts=_termination_attempts)
         else:
             console.print("[yellow]No data captured to save.[/yellow]")
+
+    _session_dead = threading.Event()
 
     try:
         session, pid, mode = launch_app(device, package_name, apk_path)
@@ -391,7 +399,7 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
             console.print(f"\n[yellow]Session detached: {reason}[/yellow]")
             if crash:
                 console.print(f"[red]Crash report: {crash}[/red]")
-            _save()
+            _session_dead.set()  # break the monitoring loop immediately
 
         session.on("detached", on_detached)
         with open(js_file) as f:
@@ -399,7 +407,7 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
         script = session.create_script(script_code)
 
         def on_message(message, data):
-            nonlocal start_time, api_seq_num, net_seq_num
+            nonlocal start_time, api_seq_num, net_seq_num, _termination_attempts
             if message["type"] == "send":
                 payload = message.get("payload", {})
                 if not isinstance(payload, dict):
@@ -504,10 +512,30 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
                         payload.get("path", "")
                         or payload.get("host", "")
                         or payload.get("command", "")
+                        or payload.get("func", "")
                     )
-                    console.print(
-                        f"[bold yellow][BYPASS][/bold yellow] {action}: {detail}"
+                    exit_code = payload.get("exit_code")
+                    if exit_code is not None:
+                        detail = f"code={exit_code}"
+                    
+                    pid_val = payload.get("pid")
+                    if pid_val is not None and not detail:
+                        detail = f"pid={pid_val}"
+
+                    termination_actions = (
+                        "system_exit", "runtime_exit", "kill_self",
+                        "native_exit", "activity_finish",
+                        "activity_finish_remove", "activity_finish_affinity",
                     )
+                    if action in termination_actions:
+                        _termination_attempts += 1
+                        console.print(
+                            f"[bold red][BYPASS][/bold red] {action} {detail}"
+                        )
+                    else:
+                        console.print(
+                            f"[bold yellow][BYPASS][/bold yellow] {action}: {detail}"
+                        )
                 elif msg_type == "exec":
                     cmd = payload.get("command", "")
                     console.print(f"[bold red][EXEC][/bold red] {cmd}")
@@ -598,8 +626,15 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
         try:
             deadline = time.time() + duration
             while time.time() < deadline:
+                if _session_dead.is_set():
+                    console.print(
+                        f"\n[yellow]Target process terminated early. "
+                        f"Captured {len(api_sequence)} API + {len(network_sequence)} network events so far.[/yellow]"
+                    )
+                    break
                 time.sleep(0.1)
-            console.print(f"\n[yellow]Duration ({duration}s) reached. Stopping capture...[/yellow]")
+            else:
+                console.print(f"\n[yellow]Duration ({duration}s) reached. Stopping capture...[/yellow]")
         except KeyboardInterrupt:
             console.print("\n[yellow]Stopping capture... (press Ctrl+C again to force quit)[/yellow]")
             # force-exit handler (Ctrl+C)

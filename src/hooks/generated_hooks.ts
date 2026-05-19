@@ -18,6 +18,8 @@ declare const DebugSymbol: any;
 declare const Backtracer: any;
 declare const Thread: any;
 declare const rpc: any;
+declare const NativeCallback: any;
+declare const NativeFunction: any;
 
 console.log('[*] Detected frameworks: native_java');
 
@@ -40,13 +42,18 @@ function _send(payload: any, data?: any) {
 }
 
 // catches errors per-hook so one failing hook does not prevent others from installing
-function safeJavaHook(className: string, methodName: string, hookFn: (cls: any) => void) {
+function safeJavaHook(className: string, methodName: string, hookFn: (cls: any) => void, optional?: boolean) {
     try {
         const cls = Java.use(className);
         hookFn(cls);
         console.log('[+] Hooked ' + className + '.' + methodName);
     } catch (e) {
-        console.log('[-] Failed to hook ' + className + '.' + methodName + ': ' + e);
+        const errStr = '' + e;
+        if (optional && errStr.indexOf('ClassNotFoundException') !== -1) {
+            console.log('[~] ' + className + ' not present in this APK (optional, skipped)');
+        } else {
+            console.log('[-] Failed to hook ' + className + '.' + methodName + ': ' + e);
+        }
     }
 }
 
@@ -109,12 +116,111 @@ function captureBacktrace(ctx: any): string[] {
 const _hookedNative: any = {};  // track which native funcs we already hooked
 const _hookedClasses: any = {}; // track which Java classes we already hooked
 
-// ============================================================
-// Anti-Detection Bypass: Root, Frida, and SSL pinning
-// malware often detects analysis environments and changes behavior
-// ============================================================
-console.log('[*] Installing anti-detection bypass.');
+console.log('[*] Installing anti-termination hooks.');
 
+Java.perform(() => {
+    try {
+        const _System = Java.use('java.lang.System');
+        _System.exit.implementation = function(code: any) {
+            console.log('[BYPASS] System.exit(' + code + ') blocked');
+            _send({type: 'bypass', action: 'system_exit', exit_code: code, timestamp: Date.now()});
+        };
+        console.log('[+] System.exit() blocked');
+    } catch (e) {
+        console.log('[-] System.exit hook: ' + e);
+    }
+
+    try {
+        const _Runtime = Java.use('java.lang.Runtime');
+        const exitOverloads = _Runtime.exit.overloads;
+        for (let i = 0; i < exitOverloads.length; i++) {
+            exitOverloads[i].implementation = function(code: any) {
+                console.log('[BYPASS] Runtime.exit(' + code + ') blocked');
+                _send({type: 'bypass', action: 'runtime_exit', exit_code: code, timestamp: Date.now()});
+            };
+        }
+        console.log('[+] Runtime.exit() blocked');
+    } catch (e) {
+        console.log('[-] Runtime.exit hook: ' + e);
+    }
+
+    try {
+        const _Process = Java.use('android.os.Process');
+        _Process.killProcess.implementation = function(pid: any) {
+            const myPid = _Process.myPid();
+            if (pid === myPid) {
+                console.log('[BYPASS] Process.killProcess(self=' + pid + ') blocked');
+                _send({type: 'bypass', action: 'kill_self', pid: pid, timestamp: Date.now()});
+                return;
+            }
+            // allow killing other processes
+            _Process.killProcess.call(this, pid);
+        };
+        console.log('[+] Process.killProcess(self) blocked');
+    } catch (e) {
+        console.log('[-] Process.killProcess hook: ' + e);
+    }
+
+    try {
+        const Activity = Java.use('android.app.Activity');
+        const origFinish = Activity.finish.overloads;
+        for (let i = 0; i < origFinish.length; i++) {
+            origFinish[i].implementation = function() {
+                console.log('[BYPASS] Activity.finish() blocked');
+                _send({type: 'bypass', action: 'activity_finish', timestamp: Date.now()});
+            };
+        }
+        console.log('[+] Activity.finish() blocked');
+    } catch (e) {}
+
+    try {
+        const Activity = Java.use('android.app.Activity');
+        if (Activity.finishAndRemoveTask) {
+            Activity.finishAndRemoveTask.implementation = function() {
+                console.log('[BYPASS] Activity.finishAndRemoveTask() blocked');
+                _send({type: 'bypass', action: 'activity_finish_remove', timestamp: Date.now()});
+            };
+        }
+    } catch (e) {}
+
+    try {
+        const Activity = Java.use('android.app.Activity');
+        if (Activity.finishAffinity) {
+            Activity.finishAffinity.implementation = function() {
+                console.log('[BYPASS] Activity.finishAffinity() blocked');
+                _send({type: 'bypass', action: 'activity_finish_affinity', timestamp: Date.now()});
+            };
+        }
+    } catch (e) {}
+
+    console.log('[+] Anti-termination hooks installed');
+});
+
+try {
+    const _libc = Process.findModuleByName('libc.so');
+    if (_libc) {
+        const exitFuncs = ['exit', '_exit', '_Exit'];
+        for (const fn of exitFuncs) {
+            const ptr = _libc.findExportByName(fn);
+            if (ptr) {
+                Interceptor.replace(ptr, new NativeCallback(function(code: number) {
+                    console.log('[BYPASS] Native ' + fn + '(' + code + ') blocked');
+                    _send({type: 'bypass', action: 'native_exit', func: fn, exit_code: code, timestamp: Date.now()});
+                    // block — do not call original.  The thread will hang here,
+                    // but the process survives.  Use an infinite sleep so the
+                    // calling thread doesn't return to its caller.
+                    const _sleep = new NativeFunction(_libc!.findExportByName('sleep')!, 'uint32', ['uint32']);
+                    while (true) { _sleep(3600); }
+                }, 'void', ['int']));
+                console.log('[+] Native ' + fn + '() blocked');
+            }
+        }
+    }
+} catch (e) {
+    console.log('[-] Native exit hooks: ' + e);
+}
+
+console.log('[*] Installing anti-detection bypass.');
 Java.perform(() => {
     setTimeout(() => {
     const rootIndicators = [
@@ -278,7 +384,6 @@ Java.perform(() => {
         }
     });
 
-    // OkHttp3
     safeJavaHook('okhttp3.OkHttpClient', 'newCall', (cls: any) => {
         const overloads = cls.newCall.overloads;
         for (let i = 0; i < overloads.length; i++) {
@@ -294,9 +399,9 @@ Java.perform(() => {
                 return overload.apply(this, arguments);
             };
         }
-    });
+    }, true);
 
-    // OkHttp3 response body
+    // OkHttp3 response body — also optional (see above)
     safeJavaHook('okhttp3.ResponseBody', 'string', (cls: any) => {
         const overloads = cls.string.overloads;
         for (let i = 0; i < overloads.length; i++) {
@@ -310,7 +415,7 @@ Java.perform(() => {
                 return body;
             };
         }
-    });
+    }, true);
 
     hookAllOverloads('java.net.Socket', '$init', (args: any[]) => {
         try {
@@ -1057,7 +1162,7 @@ Java.perform(() => {
                 _send({type: 'network', action: 'volley_request', method: '' + method, url: '' + url, timestamp: Date.now()});
             } catch (e) {}
         });
-    });
+    }, true);
 
     // malware often loads additional DEX files at runtime to hide payloads
     hookAllOverloads('dalvik.system.DexClassLoader', '$init', (args: any[]) => {
@@ -1213,14 +1318,10 @@ function scanStaticJniExports(libPath: string) {
 }
 
 try {
-    const dlopenPtr = Module.findExportByName('libc.so', 'dlopen');
-    const androidDlopenExtPtr = Module.findExportByName('libdl.so', 'android_dlopen_ext') ||
-                                Module.findExportByName('libc.so', 'android_dlopen_ext');
-
     const _dlopenCallbacks = {
         onEnter: function(this: any, args: any) {
             try {
-                const path = args[0].readUtf8String();
+                const path = args[0] ? args[0].readUtf8String() : null;
                 if (path) {
                     this._dlopenPath = path;
                     this._dlopenBt = captureBacktrace(this.context);
@@ -1251,13 +1352,36 @@ try {
         }
     };
 
+    function _findExport(funcName: string, candidates: string[]): any {
+        for (const modName of candidates) {
+            try {
+                const mod = Process.findModuleByName(modName);
+                if (mod) {
+                    const addr = mod.findExportByName(funcName);
+                    if (addr) return addr;
+                }
+            } catch (e) {}
+        }
+        return null;
+    }
+
+    const _dlopenCandidates = ['libc.so', 'libdl.so', 'linker64', 'linker'];
+    const dlopenPtr = _findExport('dlopen', _dlopenCandidates);
+    const androidDlopenExtPtr = _findExport('android_dlopen_ext', _dlopenCandidates);
+
+    let _dlopenWatcherOk = false;
     if (dlopenPtr) {
         Interceptor.attach(dlopenPtr, _dlopenCallbacks);
         console.log('[+] dlopen watcher');
+        _dlopenWatcherOk = true;
     }
     if (androidDlopenExtPtr) {
         Interceptor.attach(androidDlopenExtPtr, _dlopenCallbacks);
         console.log('[+] android_dlopen_ext watcher');
+        _dlopenWatcherOk = true;
+    }
+    if (!_dlopenWatcherOk) {
+        console.log('[~] dlopen watcher: no dlopen/android_dlopen_ext export found (hooks via libc & SSL still active)');
     }
 } catch (e) {
     console.log('[-] dlopen watcher failed: ' + e);
