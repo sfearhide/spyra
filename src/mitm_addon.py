@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
-"""
-mitmproxy addon for Spyra.
-
-Passed to mitmdump with: mitmdump -s src/mitm_addon.py --set flows_file=<path>
-
-Each intercepted HTTP/HTTPS response is appended as a JSON record to the
-flows JSONL file, which MITMController merges into network_sequence.json
-at session end.
-"""
-
 import json
 import time
 from pathlib import Path
 
 
 MAX_BODY_BYTES = 8192
-
 
 class SpyraAddon:
     def __init__(self, flows_file: str):
@@ -24,11 +13,9 @@ class SpyraAddon:
 
     def response(self, flow) -> None:
         try:
-            # req body preview
             req_body_raw = flow.request.content or b""
             req_preview = req_body_raw[:MAX_BODY_BYTES].decode("utf-8", errors="replace")
 
-            # response body preview
             resp_body_raw = flow.response.content or b""
             resp_preview = resp_body_raw[:MAX_BODY_BYTES].decode("utf-8", errors="replace")
 

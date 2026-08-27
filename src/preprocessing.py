@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-LSTM Preprocessing Pipeline for Spyra
-
-Converts raw JSON capture output into fixed-dimensional tensors suitable
-for LSTM training. Addresses the tokenization gap identified in the thesis
-review:
-
-  1. API-name vocabulary and integer tokenizer
-  2. Strategy for variable-length string fields (hash/truncate/discard)
-  3. Normalization for timestamp / relative_time fields
-  4. Defined sequence-length window (sliding window of N events)
-"""
-
 import json
 import hashlib
 import argparse
@@ -21,8 +8,11 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field, asdict
 from collections import Counter
 
+try:
+    from .schema import SCHEMA_VERSION, SUPPORTED_SCHEMAS
+except ImportError:
+    from schema import SCHEMA_VERSION, SUPPORTED_SCHEMAS
 
-# vocabulary & tokenizer
 
 RESERVED_TOKENS = ["<PAD>", "<UNK>", "<SOS>", "<EOS>"]
 
@@ -31,6 +21,7 @@ def build_event_key(event: dict) -> str:
     action = event.get("action", "")
     func = event.get("func", "")  # native hooks use 'func' not 'action'
     key = etype
+
     if action:
         key += ":" + action
     elif func:
@@ -99,7 +90,6 @@ def extract_features(event: dict, vocab: Vocabulary, max_time: float) -> np.ndar
     features[4] = 1.0 if event.get("url") else 0.0 # has URL
     features[5] = 1.0 if event.get("payload_hex") else 0.0 # has payload
 
-    # port
     port = event.get("port", 0)
     try:
         features[6] = int(port) / 65535.0
@@ -165,6 +155,7 @@ def preprocess_capture(
     net_file: Path,
     vocab: Vocabulary,
     config: PreprocessingConfig,
+    fit: bool = False,
 ) -> Tuple[np.ndarray, int, dict]:
     with open(api_file) as f:
         api_data = json.load(f)
@@ -172,6 +163,17 @@ def preprocess_capture(
         net_data = json.load(f)
 
     metadata = api_data.get("metadata", {})
+    version = metadata.get("schema_version")
+    if version is None:
+        raise ValueError(
+            "capture without schema_version (legacy pre-2.0 capture); "
+            "re-capture the sample or migrate the artifact"
+        )
+    if version not in SUPPORTED_SCHEMAS:
+        raise ValueError(
+            f"unsupported schema version {version!r} "
+            f"(supported: {sorted(SUPPORTED_SCHEMAS)})"
+        )
     label_str = metadata.get("label", "unlabeled")
     label_int = LABEL_MAP.get(label_str, -1)
 
@@ -184,9 +186,10 @@ def preprocess_capture(
         return empty, label_int, metadata
 
     # training mode - build vocabulary
-    for evt in all_events:
-        key = build_event_key(evt)
-        vocab.add(key)
+    if fit:
+        for evt in all_events:
+            key = build_event_key(evt)
+            vocab.add(key)
 
     max_time = max(e.get("relative_time", 0.0) for e in all_events)
     max_time = max(max_time, 1.0)  # avoid division by zero
@@ -201,12 +204,37 @@ def preprocess_capture(
     return windows, label_int, metadata
 
 
+def collect_event_keys(api_file: Path, net_file: Optional[Path] = None) -> List[str]:
+    if net_file is None:
+        net_file = api_file.parent / api_file.name.replace(
+            "_api_sequence.json", "_network_sequence.json"
+        )
+
+    keys: List[str] = []
+
+    for path in (api_file, net_file):
+        if not Path(path).exists():
+            continue
+        with open(path) as f:
+            data = json.load(f)
+        for evt in data.get("sequence", []):
+            keys.append(build_event_key(evt))
+    return keys
+
+
+def load_vocabulary(path: Path) -> Vocabulary:
+    with open(path) as f:
+        return Vocabulary.from_dict(json.load(f))
+
+
 def preprocess_directory(
     input_dir: Path,
     config: PreprocessingConfig,
     output_dir: Optional[Path] = None,
+    frozen_vocab: Optional[Vocabulary] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Vocabulary, dict]:
-    vocab = Vocabulary()
+    vocab = frozen_vocab if frozen_vocab is not None else Vocabulary()
+    fitting = frozen_vocab is None
     all_windows = []
     all_labels = []
     sample_metadata = []
@@ -217,15 +245,22 @@ def preprocess_directory(
         print(f"[!] No API sequence files found in {input_dir}")
         return np.array([]), np.array([]), vocab, {}
 
+    if fitting:
+        for api_file in api_files:
+            for key in collect_event_keys(api_file):
+                vocab.add(key)
+
     for api_file in api_files:
         net_file = api_file.parent / api_file.name.replace("_api_sequence.json", "_network_sequence.json")
-        
+
         if not net_file.exists():
             print(f"[!] Missing network sequence for {api_file.name}, skipping")
             continue
-        
+
         try:
-            windows, label, meta = preprocess_capture(api_file, net_file, vocab, config)
+            windows, label, meta = preprocess_capture(
+                api_file, net_file, vocab, config, fit=False,
+            )
             if windows.shape[0] > 0:
                 all_windows.append(windows)
                 all_labels.extend([label] * windows.shape[0])
@@ -287,10 +322,291 @@ def main():
     parser.add_argument("--window", type=int, default=200, help="Sliding window size (default: 200)")
     parser.add_argument("--stride", type=int, default=50, help="Sliding window stride (default: 50)")
     parser.add_argument("-o", "--output", type=Path, default=None, help="Output directory")
+    parser.add_argument(
+        "--layout",
+        choices=["legacy", "multichannel"],
+        default="multichannel",
+        help="Encoding layout (N6). 'multichannel' emits per-channel token "
+             "indices + numeric features with sample-level splits; 'legacy' "
+             "keeps the single-matrix v1 behavior.",
+    )
+    parser.add_argument(
+        "--vocab",
+        type=Path,
+        default=None,
+        help="Frozen vocab.json to encode with (transform mode, legacy layout "
+             "only). Omit to fit a new vocabulary on the input dir.",
+    )
 
     args = parser.parse_args()
     config = PreprocessingConfig(window_size=args.window, stride=args.stride)
-    preprocess_directory(args.input_dir, config, args.output)
+    if args.layout == "legacy":
+        frozen = load_vocabulary(args.vocab) if args.vocab else None
+        preprocess_directory(args.input_dir, config, args.output, frozen_vocab=frozen)
+    else:
+        if args.vocab:
+            parser.error("--vocab applies to legacy layout only")
+        preprocess_directory_multichannel(args.input_dir, config, output_dir=args.output)
+
+
+CHANNELS = ("api", "network", "native")
+_NETWORK_TYPES = frozenset({
+    "network", "http", "https", "okhttp", "socket", "ssl",
+})
+_NATIVE_TYPES = frozenset({"native", "stalker"})
+NUMERIC_DIM = 7
+_NUMERIC_KEYS = ("has_path", "has_url", "has_payload", "port_norm",
+                 "bytes_log", "exec_flag", "delta_norm")
+
+
+def event_channel(event: dict) -> str:
+    t = event.get("type", "")
+    if t in _NETWORK_TYPES:
+        return "network"
+    if t in _NATIVE_TYPES:
+        return "native"
+    return "api"
+
+
+def fit_channel_vocabularies(events: list) -> Dict[str, Vocabulary]:
+    vocabs = {c: Vocabulary() for c in CHANNELS}
+    for evt in events:
+        vocabs[event_channel(evt)].add(build_event_key(evt))
+    return vocabs
+
+
+def _numeric_features(event: dict, prev_time: float) -> np.ndarray:
+    f = np.zeros(NUMERIC_DIM, dtype=np.float32)
+    f[0] = 1.0 if event.get("path") else 0.0
+    f[1] = 1.0 if event.get("url") else 0.0
+    f[2] = 1.0 if event.get("payload_hex") else 0.0
+
+    try:
+        f[3] = int(event.get("port", 0)) / 65535.0
+    except (ValueError, TypeError):
+        pass
+
+    try:
+        f[4] = np.log1p(float(event.get("bytes", 0))) / 20.0
+    except (ValueError, TypeError):
+        pass
+
+    f[5] = 1.0 if event.get("is_exec") or event.get("action") == "mprotect_exec" else 0.0
+    try:
+        dt = float(event.get("relative_time", 0.0)) - prev_time
+    except (TypeError, ValueError):
+        dt = 0.0
+
+    f[6] = min(max(dt, 0.0), 10.0) / 10.0
+    return f
+
+
+def encode_capture_multichannel(events, vocabs: Dict[str, Vocabulary],
+                                config: PreprocessingConfig) -> dict:
+    pad_id = vocabs[CHANNELS[0]].token2idx["<PAD>"]
+    unk_ids = {c: vocabs[c].token2idx["<UNK>"] for c in CHANNELS}
+    tokens = {c: [] for c in CHANNELS}
+    numeric = np.zeros((len(events), NUMERIC_DIM), dtype=np.float32)
+    active = {c: 0 for c in CHANNELS}
+    unknown = {c: 0 for c in CHANNELS}
+
+    prev_t = None
+    for i, evt in enumerate(events):
+        ch = event_channel(evt)
+        key = build_event_key(evt)
+        idx = vocabs[ch].encode(key)
+
+        if idx == unk_ids[ch]:
+            unknown[ch] += 1
+
+        tokens[ch].append(idx)
+        active[ch] += 1
+        for other in CHANNELS:
+            if other != ch:
+                tokens[other].append(pad_id)
+
+        t = evt.get("relative_time", 0.0)
+        try:
+            t = float(t)
+        except (TypeError, ValueError):
+            t = prev_t if prev_t is not None else 0.0
+        numeric[i] = _numeric_features(evt, prev_t if prev_t is not None else t)
+        prev_t = t
+
+    unk_rate = {
+        c: (unknown[c] / active[c]) if active[c] else 0.0 for c in CHANNELS
+    }
+    return {
+        "tokens": {c: np.asarray(tokens[c], dtype=np.int32) for c in CHANNELS},
+        "numeric": numeric,
+        "unk_rate": unk_rate,
+        "numeric_dim": NUMERIC_DIM,
+        "_active": active,
+    }
+
+
+def assign_sample_splits(sha256s, ratios=(0.8, 0.15, 0.05)):
+    assert abs(sum(ratios) - 1.0) < 1e-6
+    cuts = (ratios[0], ratios[0] + ratios[1])
+    out = {}
+    for sha in sha256s:
+        h = int(hashlib.md5(sha.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+        out[sha] = "train" if h < cuts[0] else "val" if h < cuts[1] else "test"
+    return out
+
+
+def _load_capture_events(api_file: Path):
+    net_file = api_file.parent / api_file.name.replace(
+        "_api_sequence.json", "_network_sequence.json"
+    )
+
+    if not net_file.exists():
+        return None, None
+
+    api_data = json.loads(api_file.read_text())
+
+    meta = api_data.get("metadata", {})
+    version = meta.get("schema_version")
+    if version not in SUPPORTED_SCHEMAS:
+        raise ValueError(f"unsupported schema version {version!r} in {api_file}")
+
+    events = api_data.get("sequence", []) + json.loads(net_file.read_text()).get("sequence", [])
+    events.sort(key=lambda e: e.get("relative_time", 0.0))
+    return events, meta
+
+
+def _write_capture(directory: Path, pkg: str, metadata: dict, sequence: list):
+    directory.mkdir(parents=True, exist_ok=True)
+    for kind in ("api", "network"):
+        payload = {"metadata": dict(metadata), "sequence": sequence}
+        (directory / f"{pkg}_{kind}_sequence.json").write_text(json.dumps(payload))
+
+
+def preprocess_directory_multichannel(input_dir: Path,
+                                      config: PreprocessingConfig,
+                                      output_dir: Optional[Path] = None,
+                                      unk_warn: float = 0.2) -> dict:
+    input_dir = Path(input_dir)
+    api_files = sorted(input_dir.rglob("*_api_sequence.json"))
+    if not api_files:
+        print(f"[!] No API sequence files found in {input_dir}")
+        return {}
+
+    captures = []
+    all_keys = {c: [] for c in CHANNELS}
+
+    for api_file in api_files:
+        try:
+            events, meta = _load_capture_events(api_file)
+        except ValueError as e:
+            print(f"  [!] {e}")
+            continue
+        if events is None:
+            print(f"[!] Missing network sequence for {api_file.name}, skipping")
+            continue
+
+        captures.append((api_file, events, meta))
+        for evt in events:
+            all_keys[event_channel(evt)].append(build_event_key(evt))
+
+    vocabs = {c: Vocabulary() for c in CHANNELS}
+    for c in CHANNELS:
+        for key in all_keys[c]:
+            vocabs[c].add(key)
+
+    shas = [meta.get("apk_sha256") or api_file.parent.name
+            for api_file, _, meta in captures]
+    splits = assign_sample_splits(shas)
+
+    pad_id = vocabs["api"].token2idx["<PAD>"]
+    win = config.window_size
+    stride = config.stride
+
+    def _windows(a, w=win, s=stride, pad_value=None):
+        n = len(a)
+        if n < w:
+            if pad_value is None:
+                shape = (w - n,) + a.shape[1:]
+                fill = np.zeros(shape, dtype=a.dtype)
+            else:
+                fill = np.full(w - n, pad_value, dtype=a.dtype)
+            return np.concatenate([a, fill])[np.newaxis, :]
+        return np.stack([a[start:start + w]
+                         for start in range(0, n - w + 1, s)])
+
+    per_split = {s: {c: [] for c in CHANNELS} | {"numeric": [], "labels": []}
+                 for s in ("train", "val", "test")}
+    window_owners = []
+    samples_meta = []
+
+    for api_file, events, meta in captures:
+        sha = meta.get("apk_sha256") or api_file.parent.name
+        label = LABEL_MAP.get(meta.get("label", "unlabeled"), -1)
+        enc = encode_capture_multichannel(events, vocabs, config)
+        n_win = max(1, (len(events) - win) // stride + 1) if len(events) >= win else 1
+
+        tw = {c: _windows(enc["tokens"][c], pad_value=pad_id) for c in CHANNELS}
+        nw = _windows(enc["numeric"])
+        split = splits[sha]
+
+        for c in CHANNELS:
+            per_split[split][c].append(tw[c])
+
+        per_split[split]["numeric"].append(nw)
+        per_split[split]["labels"].extend([label] * len(nw))
+        window_owners.extend([(split, sha)] * len(nw))
+
+        for c in CHANNELS:
+            rate = enc["unk_rate"][c]
+            if rate > unk_warn:
+                print(f"  [!] HIGH UNK {api_file.stem} [{c}]: {rate:.0%}")
+
+        samples_meta.append({
+            "file": str(api_file), "package": meta.get("package_name", ""),
+            "sha256": sha, "label": meta.get("label", "unlabeled"),
+            "n_windows": int(nw.shape[0]), "split": split,
+            "unk_rate": enc["unk_rate"],
+            "events_active": enc["_active"],
+        })
+
+    if output_dir is None:
+        output_dir = input_dir.parent / f"{input_dir.name}_mc"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_shapes = {}
+    for split, bundle in per_split.items():
+        if not bundle["labels"]:
+            continue
+
+        for c in CHANNELS:
+            arr = np.concatenate(bundle[c], axis=0) if bundle[c] else np.zeros((0, win), np.int32)
+            np.save(output_dir / f"tokens_{c}_{split}.npy", arr)
+            saved_shapes[f"{c}_{split}"] = arr.shape
+
+        X = np.concatenate(bundle["numeric"], axis=0)
+        y = np.array(bundle["labels"], dtype=np.int32)
+        np.save(output_dir / f"numeric_{split}.npy", X)
+        np.save(output_dir / f"labels_{split}.npy", y)
+        saved_shapes[f"numeric_{split}"] = X.shape
+
+    (output_dir / "splits.json").write_text(json.dumps(splits, indent=2))
+    (output_dir / "vocab.json").write_text(json.dumps(
+        {c: v.to_dict() for c, v in vocabs.items()}, indent=2))
+
+    pipeline_meta = {
+        "config": asdict(config),
+        "layout": "multichannel",
+        "numeric_dim": NUMERIC_DIM,
+        "vocab_sizes": {c: len(v) for c, v in vocabs.items()},
+        "samples": samples_meta,
+    }
+
+    (output_dir / "metadata.json").write_text(json.dumps(pipeline_meta, indent=2))
+    print(f"[mc] wrote {output_dir}; shapes={saved_shapes}")
+
+    return {"splits": splits, "window_owners": window_owners,
+            "vocabs": vocabs, "metadata": pipeline_meta}
 
 
 if __name__ == "__main__":

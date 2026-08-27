@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-MITM Controller for Spyra.
-
-Manages the mitmdump subprocess lifecycle, device proxy configuration,
-CA cert installation, and merges captured flows into network_sequence.json.
-"""
-
 import json
 import os
 import shutil
@@ -15,9 +8,12 @@ from pathlib import Path
 from typing import Optional
 
 
-class MITMController:
-    """Orchestrates mitmproxy for full HTTPS capture alongside Frida."""
+def reverse_list_contains(listing: str, port: int) -> bool:
+    needle = f"tcp:{port}"
+    return any(needle in line for line in listing.splitlines())
 
+
+class MITMController:
     def __init__(
         self,
         output_dir: str,
@@ -34,7 +30,6 @@ class MITMController:
         return self.output_dir / "mitm_flows.jsonl"
 
     def is_available(self) -> bool:
-        """Return True if mitmdump is on PATH."""
         return shutil.which("mitmdump") is not None
 
     def _adb(self, *args, timeout: int = 15) -> subprocess.CompletedProcess:
@@ -81,6 +76,11 @@ class MITMController:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._kill_stale_mitmdump()
 
+        try:
+            self.flows_file.unlink()
+        except FileNotFoundError:
+            pass
+
         addon_path = Path(__file__).parent / "mitm_addon.py"
         self._proc = subprocess.Popen(
             [
@@ -101,6 +101,16 @@ class MITMController:
 
         self._adb("shell", "settings", "put", "global", "http_proxy",
                   f"127.0.0.1:{self.port}")
+        self._adb("reverse", f"tcp:{self.port}", f"tcp:{self.port}")
+
+        listing = self._adb("reverse", "--list")
+        if not reverse_list_contains(listing.stdout or "", self.port):
+            print(
+                f"[mitm] WARNING: adb reverse tcp:{self.port} not active — "
+                "HTTPS capture will not work over this transport"
+            )
+        else:
+            print(f"[mitm] adb reverse tcp:{self.port} verified")
         self._install_ca_cert()
 
         return self._proc.poll() is None
@@ -114,6 +124,7 @@ class MITMController:
                 self._proc.kill()
         self._proc = None
         self._adb("shell", "settings", "delete", "global", "http_proxy")
+        self._adb("reverse", "--remove", f"tcp:{self.port}")
 
     def _install_ca_cert(self) -> None:
         cert_path = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.cer"
@@ -148,11 +159,6 @@ class MITMController:
         network_sequence_path: str,
         session_start_time: float,
     ) -> None:
-        """Merge captured mitm flows into the network_sequence.json file.
-
-        Each flow becomes a {"type": "mitm", ...} event sorted by relative_time.
-        """
-
         if not self.flows_file.exists():
             return
 
@@ -163,6 +169,8 @@ class MITMController:
         with open(net_path) as f:
             net_seq = json.load(f)
 
+        anchor = net_seq.get("metadata", {}).get("clock_anchor_epoch") or session_start_time
+
         sequence = net_seq.get("sequence", [])
         with open(self.flows_file) as f:
             for line in f:
@@ -171,7 +179,7 @@ class MITMController:
                     continue
                 try:
                     flow = json.loads(line)
-                    relative_time = flow["timestamp"] - session_start_time
+                    relative_time = flow["timestamp"] - anchor
                     event = {
                         "type": "mitm",
                         "method": flow.get("method", ""),

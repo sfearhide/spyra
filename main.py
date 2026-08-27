@@ -16,9 +16,9 @@ from rich.table import Table
 from datetime import datetime
 from rich.console import Console
 from urllib.parse import urlparse
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from src.ui_exerciser import UIExerciser
 from src.mitm_controller import MITMController
+from src.schema import SCHEMA_VERSION
 
 
 console = Console()
@@ -48,13 +48,25 @@ def check_dependencies():
     return True
 
 
-def check_frida_server():
+def get_frida_device(serial=None):
+    if serial:
+        return frida.get_device_manager().get_device(serial, timeout=5)
     try:
-        device = frida.get_usb_device(timeout=3)
-        console.print(f"[green]✓ Frida server connected: {device.name}[/green]")
+        return frida.get_usb_device(timeout=3)
+    except (frida.TimedOutError, frida.ServerNotRunningError, ValueError):
+        for dev in frida.enumerate_devices():
+            if dev.type not in ("local",):
+                return dev
+        raise
+
+
+def check_frida_server(serial=None):
+    try:
+        device = get_frida_device(serial)
+        console.print(f"[green]✓ Frida device connected: {device.name} ({device.id})[/green]")
         return device
     except frida.TimedOutError:
-        console.print("[red]✗ No USB device found[/red]")
+        console.print("[red]✗ No Frida device found[/red]")
         return None
     except frida.ServerNotRunningError:
         console.print("[red]✗ Frida server not running on device[/red]")
@@ -86,7 +98,7 @@ def decompile_apk(apk_path):
     return output_dir
 
 
-def detect_frameworks(decompiled_dir):
+def detect_frameworks(decompiled_dir, bypass="all"):
     sys.path.insert(0, str(Path(__file__).parent / "src"))
     from framework_detector import FrameworkDetector, HookGenerator
     import xml.etree.ElementTree as ET
@@ -123,7 +135,7 @@ def detect_frameworks(decompiled_dir):
             console.print("[yellow]Could not parse AndroidManifest.xml[/yellow]")
 
     console.print("[cyan]Generating hooks..[/cyan]")
-    generator = HookGenerator(frameworks)
+    generator = HookGenerator(frameworks, bypass=bypass)
     script, is_typescript = generator.generate_hooks()
 
     hooks_dir = Path("src/hooks")
@@ -164,6 +176,106 @@ def extract_domain(url):
     except Exception:
         return ""
 
+AGENT_EVENT_TYPES = frozenset({
+    "network", "http", "https", "okhttp", "socket", "ssl",
+    "crypto", "file", "system", "native", "bypass", "exec",
+    "api", "scan", "hook", "react_native", "flutter", "unity",
+    "prefs", "webview", "intent", "stalker", "dex_dump",
+})
+
+
+def compute_coverage(agent_stats):
+    events = agent_stats.get("events") or {}
+    hooks = agent_stats.get("hooks") or {}
+    events_by_type = {t: c for t, c in events.items() if isinstance(c, int)}
+
+    fired_detail = {
+        k: v for k, v in hooks.items()
+        if k.startswith("fired:") and isinstance(v, int)
+    }
+
+    installed = sum(
+        v for k, v in hooks.items()
+        if not k.startswith("fired:") and isinstance(v, int)
+    )
+
+    fired = sorted(t for t in AGENT_EVENT_TYPES if events_by_type.get(t, 0) > 0)
+    return {
+        "hooks_installed": installed,
+        "hooks_fired": len(fired_detail),
+        "hooks_fired_detail": fired_detail,
+        "events_by_type": events_by_type,
+        "event_types_fired": fired,
+        "coverage_ratio": round(len(fired) / len(AGENT_EVENT_TYPES), 3),
+    }
+
+
+def epoch_seconds_from_payload(payload):
+    ts = payload.get("timestamp")
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return time.time()
+    if ts > 1e11:  # epoch ms
+        return ts / 1000.0
+    return ts
+
+
+def write_logcat_lines(lines, out_path, predicates):
+    kept = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        for line in lines:
+            line = line.rstrip("\n")
+
+            if not any(p(line) for p in predicates):
+                continue
+
+            parts = line.split(" ", 2)
+            epoch_ts = None
+            if len(parts) >= 2:
+                try:
+                    epoch_ts = float(parts[0])
+                except ValueError:
+                    pass
+
+            f.write(json.dumps({
+                "epoch_ts": epoch_ts,
+                "message": line,
+            }) + "\n")
+            kept += 1
+    return kept
+
+
+def collect_logcat(package_name, adb_serial, out_file):
+    cmd = ["adb"]
+    if adb_serial:
+        cmd += ["-s", adb_serial]
+
+    cmd += ["logcat", "-d", "-v", "epoch"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=20,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except Exception as e:
+        console.print(f"[yellow]logcat collection failed: {e}[/yellow]")
+        return False
+
+    lines = (result.stdout or "").splitlines()
+
+    def _match(ln):
+        return package_name in ln or "ANR in" in ln or "FATAL EXCEPTION" in ln
+
+    kept = write_logcat_lines(
+        lines, out_file,
+        predicates=[
+            lambda ln: package_name in ln,
+            lambda ln: "FATAL EXCEPTION" in ln,
+        ],
+    )
+    console.print(f"[green]✓ Saved logcat artifact: {out_file} ({kept} lines)[/green]")
+    return True
+
 
 def compute_apk_hash(apk_path):
     sha256 = hashlib.sha256()
@@ -173,7 +285,7 @@ def compute_apk_hash(apk_path):
     return sha256.hexdigest()
 
 
-def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, label=None, label_source=None, termination_attempts=0):
+def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, label=None, label_source=None, termination_attempts=0, clock_anchor=None, capture_errors=0, extra_meta=None):
     output_dir = Path("output") / package_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -185,6 +297,7 @@ def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, la
 
     base_metadata = {
         "package_name": package_name,
+        "schema_version": SCHEMA_VERSION,
         "apk_sha256": apk_hash,
         "label": label or "unlabeled",
         "label_source": label_source,
@@ -192,6 +305,10 @@ def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, la
         "capture_end": end_iso,
         "duration_seconds": round(duration, 3),
         "termination_attempts": termination_attempts,
+        "clock_anchor_epoch": round(clock_anchor, 6) if clock_anchor else None,
+        # script errors and flush/detach failures counter
+        "capture_errors": capture_errors,
+        **(extra_meta or {}),
     }
 
     api_data = {
@@ -228,9 +345,7 @@ def save_sequences(package_name, api_seq, net_seq, start_time, apk_hash=None, la
 
 
 def is_app_installed(device, package_name):
-    """Check if the APK is actually installed on the device."""
     try:
-        # device.enumerate_applications() returns installed apps
         for app in device.enumerate_applications():
             if app.identifier == package_name:
                 return True
@@ -240,7 +355,6 @@ def is_app_installed(device, package_name):
 
 
 def install_apk(device, apk_path):
-    # via adb
     console.print(f"[cyan]Installing {Path(apk_path).name} on device...[/cyan]")
     result = subprocess.run(
         ["adb", "install", "-r", "-g", str(apk_path)],
@@ -265,6 +379,19 @@ def kill_app(package_name):
         timeout=10,
     )
     time.sleep(0.5)
+
+
+def uninstall_app(package_name, adb_serial=None):
+    """remove app + data so each capture starts from clean state."""
+    cmd = ["adb"]
+    if adb_serial:
+        cmd += ["-s", adb_serial]
+    cmd += ["uninstall", package_name]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    ok = "Success" in (result.stdout or "")
+    if ok:
+        console.print(f"[green]✓ Removed previous install of {package_name}[/green]")
+    return ok
 
 
 def launch_app(device, package_name, apk_path=None, max_retries=3):
@@ -367,14 +494,16 @@ def launch_app(device, package_name, apk_path=None, max_retries=3):
     )
 
 
-def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None, label=None, label_source=None, exerciser=None, duration=120):
+def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None, label=None, label_source=None, exerciser=None, duration=120, extra_meta=None):
     api_sequence = []
     network_sequence = []
     start_time = None
-    api_seq_num = 0
+    _t0_epoch = None
     net_seq_num = 0
-    _saved = False  # guard against double-save
-    _termination_attempts = 0  # count blocked System.exit / kill / finish calls
+    _saved = False
+    _termination_attempts = 0
+    _capture_errors = 0
+    _agent_stats: dict = {}
 
     def _save():
         nonlocal start_time, _saved
@@ -384,9 +513,15 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
         if start_time is None and (api_sequence or network_sequence):
             start_time = time.time()
         if api_sequence or network_sequence:
+            meta = {"agent": compute_coverage(_agent_stats)}
+            if extra_meta:
+                meta.update(extra_meta)
             save_sequences(package_name, api_sequence, network_sequence, start_time,
                            apk_hash=apk_hash, label=label, label_source=label_source,
-                           termination_attempts=_termination_attempts)
+                           termination_attempts=_termination_attempts,
+                           clock_anchor=_t0_epoch,
+                           capture_errors=_capture_errors,
+                           extra_meta=meta)
         else:
             console.print("[yellow]No data captured to save.[/yellow]")
 
@@ -406,8 +541,14 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
             script_code = f.read()
         script = session.create_script(script_code)
 
-        def on_message(message, data):
-            nonlocal start_time, api_seq_num, net_seq_num, _termination_attempts
+        def on_message(message, data, pid_label=None):
+            nonlocal start_time, api_seq_num, net_seq_num, _termination_attempts, _t0_epoch, _capture_errors
+            if message["type"] == "error":
+                _capture_errors += 1
+                console.print(
+                    f"[red][ERROR][/red] {message.get('description', message)}"
+                )
+                return
             if message["type"] == "send":
                 payload = message.get("payload", {})
                 if not isinstance(payload, dict):
@@ -418,15 +559,36 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
                         on_message({"type": "send", "payload": evt}, data)
                     return
                 msg_type = payload.get("type", "unknown")
+
+                # dropped dex payloads as frida binary data
+                if msg_type == "dex_dump" and data:
+                    dropped_dir = Path("output") / package_name / "dropped"
+                    dropped_dir.mkdir(parents=True, exist_ok=True)
+
+                    digest = hashlib.sha256(data).hexdigest()
+
+                    out_path = dropped_dir / f"{digest}.dex"
+                    out_path.write_bytes(bytes(data))
+
+                    console.print(
+                        f"[bold red][DROPPED][/bold red] {payload.get('path','?')} "
+                        f"-> dropped/{digest}.dex ({len(data)} bytes)"
+                    )
+
+                epoch_s = epoch_seconds_from_payload(payload)
+                if _t0_epoch is None:
+                    _t0_epoch = epoch_s
                 if start_time is None:
                     start_time = time.time()
-                current_time = time.time()
 
+                clean_payload = {k: v for k, v in payload.items() if k != "timestamp"}
                 event = {
-                    "timestamp": current_time,
-                    "relative_time": round(current_time - start_time, 3),
-                    **payload,
+                    "pid": pid_label if pid_label is not None else pid,
+                    "timestamp": round(epoch_s, 6),
+                    "relative_time": round(epoch_s - _t0_epoch, 3),
+                    **clean_payload,
                 }
+
                 # categorize and add to seqs
                 network_types = ["network", "http", "https", "okhttp", "socket", "ssl"]
                 if msg_type in network_types:
@@ -459,6 +621,7 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
                         method = payload.get("method", "")
                         if url:
                             console.print(f"[blue][NETWORK][/blue] {method} {url}")
+
                 elif msg_type == "crypto":
                     action = payload.get("action", "")
                     algo = payload.get("transformation") or payload.get("algorithm", "")
@@ -466,14 +629,17 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
                         console.print(f"[yellow][CRYPTO][/yellow] {action}: {algo}")
                     else:
                         console.print(f"[yellow][CRYPTO][/yellow] {action}")
+
                 elif msg_type == "file":
                     path = payload.get("path", "")
                     action = payload.get("action", "")
                     console.print(f"[green][FILE][/green] {action}: {path}")
+
                 elif msg_type == "system":
                     action = payload.get("action", "")
                     value = payload.get("value", "")
                     console.print(f"[red][SYSTEM][/red] {action} {value}")
+
                 elif msg_type == "native":
                     action = payload.get("action", "")
                     if action == "jni_register":
@@ -503,9 +669,11 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
                             console.print(
                                 f'[magenta][NATIVE][/magenta] {func}("{path}")'
                             )
+
                 elif msg_type == "ssl":
                     func = payload.get("func", "")
                     console.print(f"[cyan][SSL][/cyan] {func}")
+
                 elif msg_type == "bypass":
                     action = payload.get("action", "")
                     detail = (
@@ -536,9 +704,11 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
                         console.print(
                             f"[bold yellow][BYPASS][/bold yellow] {action}: {detail}"
                         )
+
                 elif msg_type == "exec":
                     cmd = payload.get("command", "")
                     console.print(f"[bold red][EXEC][/bold red] {cmd}")
+
                 elif msg_type == "api":
                     action = payload.get("action", "")
                     if action == "sms_send":
@@ -563,52 +733,135 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
                         console.print(f"[red][SENSITIVE API][/red] {action}")
                     else:
                         console.print(f"[red][API][/red] {action}")
+
                 elif msg_type == "scan":
                     action = payload.get("action", "")
                     cn = payload.get("className", "")
                     method = payload.get("method", "")
                     console.print(f"[yellow][SCAN][/yellow] {action}: {cn}.{method}")
+
                 elif msg_type == "hook":
                     cn = payload.get("className", "")
                     console.print(f"[green][HOOK][/green] Deferred hook: {cn}")
+
                 elif msg_type == "react_native":
                     action = payload.get("action", "")
                     module = payload.get("module", "")
                     console.print(f"[cyan][RN][/cyan] {action}: {module}")
+
                 elif msg_type == "flutter":
                     action = payload.get("action", "")
                     method = payload.get("method", "")
                     console.print(f"[cyan][FLUTTER][/cyan] {action}: {method}")
+
                 elif msg_type == "unity":
                     action = payload.get("action", "")
                     console.print(f"[cyan][UNITY][/cyan] {action}")
+
                 elif msg_type == "prefs":
                     key = payload.get("key", "")
                     value = payload.get("value", "")
                     console.print(f"[green][PREFS][/green] {key} = {value}")
+
                 elif msg_type == "webview":
                     url = payload.get("url", "")
                     console.print(f"[blue][WEBVIEW][/blue] {url}")
+
                 elif msg_type == "intent":
                     action = payload.get("intent_action", "")
                     console.print(f"[yellow][INTENT][/yellow] {action}")
+
                 elif msg_type == "stalker":
                     action = payload.get("action", "")
                     count = payload.get("count", 0)
                     if action == "call_graph":
                         console.print(f"[dim][STALKER][/dim] Native call graph: {count} events")
-            elif message["type"] == "error":
-                console.print(
-                    f"[red][ERROR][/red] {message.get('description', message)}"
-                )
 
         script.on("message", on_message)
         script.load()
+
+        # isolated child processes
+        try:
+            session.enable_child_gating()
+
+            def on_child_added(child):
+                nonlocal _capture_errors
+                try:
+                    child_session = device.attach(child.pid)
+                    child_script = child_session.create_script(script_code)
+                    child_script.on(
+                        "message",
+                        lambda m, d, cp=child.pid: on_message(m, d, pid_label=cp),
+                    )
+                    child_script.load()
+                    device.resume(child.pid)
+                    console.print(f"[green]Child process {child.pid} instrumented[/green]")
+                except Exception as e:
+                    _capture_errors += 1
+                    console.print(f"[yellow]Child gating failed: {e}[/yellow]")
+
+            device.on("child-added", on_child_added)
+        except Exception as e:
+            console.print(f"[yellow]Child gating unavailable: {e}[/yellow]")
 
         if mode == "spawn":
             device.resume(pid)
 
         console.print(f"[green]Frida script loaded ({mode} mode, PID {pid})[/green]")
+
+        TIMEOUT_SPAWN = 8.0
+        if mode == "spawn" and _session_dead.wait(timeout=TIMEOUT_SPAWN):
+            total_events = len(api_sequence) + len(network_sequence)
+            if total_events == 0:
+                console.print(
+                    "\n[bold yellow]Process died immediately after spawn with 0 events.[/bold yellow]\n"
+                    "[cyan]Retrying with attach mode (launch via adb, then inject)...[/cyan]"
+                )
+
+                _session_dead.clear()
+                _saved = False
+                api_sequence.clear()
+                network_sequence.clear()
+                api_seq_num = 0
+                net_seq_num = 0
+                start_time = None
+                _t0_epoch = None
+                _termination_attempts = 0
+
+                kill_app(package_name)
+                time.sleep(1)
+
+                subprocess.run(
+                    ["adb", "shell", "monkey", "-p", package_name,
+                     "-c", "android.intent.category.LAUNCHER", "1"],
+                    capture_output=True, timeout=15,
+                )
+                time.sleep(3)
+
+                retry_pid = None
+                for _w in range(10):
+                    try:
+                        retry_pid = device.get_process(package_name).pid
+                        break
+                    except frida.ProcessNotFoundError:
+                        time.sleep(1)
+
+                if retry_pid is None:
+                    console.print("[red]Attach retry failed: process not running.[/red]")
+                    _save()
+                    console.print("[green]Session ended[/green]")
+                    return
+
+                session = device.attach(retry_pid)
+                pid = retry_pid
+                mode = "attach"
+
+                session.on("detached", on_detached)
+                script = session.create_script(script_code)
+                script.on("message", on_message)
+                script.load()
+                console.print(f"[green]Attached to running process PID {pid} (attach retry)[/green]")
+
         console.print(
             f"[yellow]Monitoring app activity for {duration}s.. (Press Ctrl+C to stop early)[/yellow]\n"
         )
@@ -643,10 +896,29 @@ def run_frida_script(device, package_name, js_file, apk_path=None, apk_hash=None
             if exerciser is not None:
                 exerciser.stop()
 
-            try:
-                script.exports_sync.flush_buffers()
-            except Exception:
-                pass
+            def _flush():
+                try:
+                    script.exports_sync.flush_buffers()
+                except Exception:
+                    pass
+            ft = threading.Thread(target=_flush, daemon=True)
+            ft.start()
+            ft.join(timeout=2.0)
+
+            # pull agent coverage stats before detaching
+            _stats_result: dict = {}
+            def _fetch_stats():
+                try:
+                    got = script.exports_sync.get_stats()
+                    if isinstance(got, dict):
+                        _stats_result.update(got)
+                except Exception:
+                    pass
+            st = threading.Thread(target=_fetch_stats, daemon=True)
+            st.start()
+            st.join(timeout=2.0)
+            if _stats_result:
+                _agent_stats.update(_stats_result)
 
             try:
                 grace_deadline = time.time() + 1.0
@@ -735,16 +1007,59 @@ def main():
         dest="mitm_port",
         help="Port for the mitmproxy listener (default: 8080).",
     )
+    parser.add_argument(
+        "--fresh-install",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Uninstall any previous copy of the target before capture, so "
+             "every run starts from clean app state (default: on).",
+    )
+    parser.add_argument(
+        "--serial",
+        type=str,
+        default=None,
+        help="Frida/adb device serial (e.g. emulator-5554, 192.168.56.102:5555). "
+             "Defaults to first USB/remote device.",
+    )
+    parser.add_argument(
+        "--stim",
+        choices=["seeded", "monkey"],
+        default="seeded",
+        dest="stim",
+        help="Stimulation driver (N9): 'seeded' = deterministic schedule "
+             "(reproducible captures, see --stim-seed); 'monkey' = legacy "
+             "adb monkey (non-deterministic).",
+    )
+    parser.add_argument(
+        "--stim-seed",
+        type=int,
+        default=1337,
+        dest="stim_seed",
+        help="Seed for the seeded stimulation driver (default: 1337).",
+    )
+    parser.add_argument(
+        "--bypass",
+        choices=["all", "minimal", "none"],
+        default="all",
+        dest="bypass",
+        help="Countermeasure tier injected into the target (N3): 'all' = "
+             "exit-blocking + detection bypass + env spoofing; 'minimal' = "
+             "env spoofing only; 'none' = observation only. Recorded in "
+             "capture metadata for ablation (default: all).",
+    )
 
     args = parser.parse_args()
 
-    console.print(
-        Panel.fit(
-            "[bold cyan]APK Malware Analysis Automation[/bold cyan]\n"
-            "[dim]Framework Detection + API Monitoring v1.0.2[/dim]",
-            border_style="cyan",
-        )
+    banner = (
+        "[dim]██████╗ ██████╗ ██╗ ▄ ██╗██████╗ [/dim][bold green]  ▀▄  ▄▀ [/bold green]\n"
+        "[dim]██╔════╝ ██╔══██╗╚██╗███╔╝██╔══██╗[/dim][bold green]▄██████▄[/bold green]\n"
+        "[dim]███████╗ ██████╔╝ ╚████╔╝ ██████╔╝[/dim][bold green]███████║[/bold green]\n"
+        "[dim]╚════██║ ██╔═══╝   ╚██╔╝  ██╔══██╗[/dim][bold green]██╔══██║[/bold green]\n"
+        "[dim]███████║ ██║        ██║   ██║  ██║[/dim][bold green]██║  ██║[/bold green]\n"
+        "[dim]╚══════╝ ╚═╝        ╚═╝   ╚═╝  ╚═╝[/dim][bold green]╚═╝  ╚═╝[/bold green]\n\n"
+        "  [bold white]> SPYRA (v1.2) · [/bold white][italic dim]Android Dynamic Analysis & Behavioral Modeling[/italic dim]\n"
     )
+    console.print(banner)
 
     apk_path = args.apk_file
 
@@ -757,7 +1072,7 @@ def main():
         sys.exit(1)
 
     console.print("\n[bold][+] Checking Frida server[/bold]")
-    device = check_frida_server()
+    device = check_frida_server(args.serial)
     if not device:
         sys.exit(1)
 
@@ -767,7 +1082,7 @@ def main():
         sys.exit(1)
 
     console.print("\n[bold][+] Detecting frameworks[/bold]")
-    script_file, package_name = detect_frameworks(decompiled_dir)
+    script_file, package_name = detect_frameworks(decompiled_dir, bypass=args.bypass)
     if not script_file:
         sys.exit(1)
 
@@ -790,13 +1105,20 @@ def main():
     if args.label:
         console.print(f"[green]✓ Label: {args.label} (source: {args.label_source or 'unspecified'})[/green]")
 
-    adb_serial = getattr(device, 'id', None)
-    if adb_serial and not adb_serial.startswith('emulator') and ':' not in adb_serial:
+    adb_serial = args.serial or getattr(device, "id", None)
+    if adb_serial == "local":
         adb_serial = None
+
+    if args.fresh_install:
+        console.print("\n[bold][+] Fresh-state reset[/bold]")
+        uninstall_app(package_name, adb_serial)
 
     if args.exerciser:
         console.print("\n[bold][+] Granting permissions[/bold]")
-        exerciser = UIExerciser(package_name, duration=args.duration, adb_serial=adb_serial)
+        exerciser = UIExerciser(package_name, duration=args.duration,
+                                adb_serial=adb_serial,
+                                stim_mode=args.stim,
+                                stim_seed=args.stim_seed)
         exerciser.permission_sweep()
         console.print("[green]✓ Permission sweep complete[/green]")
     else:
@@ -836,6 +1158,7 @@ def main():
             label=args.label, label_source=args.label_source,
             exerciser=exerciser,
             duration=args.duration,
+            extra_meta={"bypass_tier": args.bypass},
         )
     finally:
         # always stop mitm — even on crash/SIGTERM — so the port is freed
@@ -847,6 +1170,10 @@ def main():
             if net_file.exists():
                 mitm.merge_into_network_sequence(str(net_file), session_start_time)
                 console.print(f"[green]✓ MITM flows merged into {net_file.name}[/green]")
+
+        logcat_file = Path("output") / package_name / f"{package_name}_logcat.jsonl"
+        logcat_file.parent.mkdir(parents=True, exist_ok=True)
+        collect_logcat(package_name, adb_serial, str(logcat_file))
 
 
 if __name__ == "__main__":
